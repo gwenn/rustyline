@@ -765,7 +765,7 @@ impl EditState {
             KeyPress::Ctrl('R') => Cmd::ReverseSearchHistory,
             KeyPress::Ctrl('S') => Cmd::ForwardSearchHistory, // most terminals override Ctrl+S to suspend execution
             KeyPress::Ctrl('T') => Cmd::TransposeChars,
-            KeyPress::Ctrl('U') => {
+            KeyPress::Ctrl('U') | KeyPress::KillLine => {
                 if positive {
                 Cmd::Kill(Movement::BeginningOfLine)
                 } else {

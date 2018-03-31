@@ -1,5 +1,6 @@
 //! Unix specific definitions
 use std;
+use std::collections::HashMap;
 use std::io::{self, Chars, Read, Stdout, Write};
 use std::sync;
 use std::sync::atomic;
@@ -9,8 +10,9 @@ use nix;
 use nix::poll::{self, EventFlags};
 use nix::sys::signal;
 use nix::sys::termios;
-use nix::sys::termios::SetArg;
+use nix::sys::termios::{SetArg, SpecialCharacterIndices};
 use unicode_segmentation::UnicodeSegmentation;
+use term::terminfo;
 
 use config::Config;
 use consts::{self, KeyPress};
@@ -487,6 +489,7 @@ pub type Terminal = PosixTerminal;
 pub struct PosixTerminal {
     unsupported: bool,
     stdin_isatty: bool,
+    keys: HashMap<Vec<u8>, KeyPress>,
 }
 
 impl Term for PosixTerminal {
@@ -495,11 +498,25 @@ impl Term for PosixTerminal {
     type Mode = Mode;
 
     fn new() -> PosixTerminal {
-        let term = PosixTerminal {
-            unsupported: is_unsupported_term(),
-            stdin_isatty: is_a_tty(STDIN_FILENO),
+        let unsupported = is_unsupported_term();
+        let stdin_isatty = is_a_tty(STDIN_FILENO);
+
+        let keys = if !unsupported && stdin_isatty {
+            let mut bindings = HashMap::new();
+            // currently, only escape sequences are dynamic (ambiguous).
+            // so we don't care of control chars.
+            // stty_keys(&mut bindings);
+            terminfo_keys(&mut bindings);
+            bindings
+        } else {
+            HashMap::with_capacity(0)
         };
-        if !term.unsupported && term.stdin_isatty && is_a_tty(STDOUT_FILENO) {
+        let term = PosixTerminal {
+            unsupported,
+            stdin_isatty,
+            keys,
+        };
+        if !unsupported && stdin_isatty && is_a_tty(STDOUT_FILENO) {
             install_sigwinch_handler();
         }
         term
@@ -522,7 +539,7 @@ impl Term for PosixTerminal {
 
     fn enable_raw_mode(&self) -> Result<Mode> {
         use nix::errno::Errno::ENOTTY;
-        use nix::sys::termios::{ControlFlags, InputFlags, LocalFlags, SpecialCharacterIndices};
+        use nix::sys::termios::{ControlFlags, InputFlags, LocalFlags};
         if !self.stdin_isatty {
             try!(Err(nix::Error::from_errno(ENOTTY)));
         }
@@ -535,8 +552,9 @@ impl Term for PosixTerminal {
         // we don't want raw output, it turns newlines into straight linefeeds
         // raw.c_oflag = raw.c_oflag & !(OutputFlags::OPOST); // disable all output
         // processing
-        raw.control_flags |= ControlFlags::CS8; // character-size mark (8 bits)
-                                                // disable echoing, canonical mode, extended input processing and signals
+        // character-size mark (8 bits)
+        raw.control_flags |= ControlFlags::CS8;
+        // disable echoing, canonical mode, extended input processing and signals
         raw.local_flags &=
             !(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::IEXTEN | LocalFlags::ISIG);
         raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 1; // One character-at-a-time input
@@ -553,6 +571,59 @@ impl Term for PosixTerminal {
     fn create_writer(&self) -> PosixRenderer {
         PosixRenderer::new()
     }
+}
+
+fn terminfo_keys(keys: &mut HashMap<Vec<u8>, KeyPress>) {
+    if let Ok(ti) = terminfo::TermInfo::from_env() {
+        capability(&ti, "kcub1", KeyPress::Left, keys);
+        capability(&ti, "kcuf1", KeyPress::Right, keys);
+        capability(&ti, "kcuu1", KeyPress::Up, keys); // missing
+        capability(&ti, "kcud1", KeyPress::Down, keys);
+        capability(&ti, "kbs", KeyPress::Backspace, keys);
+        capability(&ti, "kdch1", KeyPress::Delete, keys); // missing
+        capability(&ti, "khome", KeyPress::Home, keys);
+        capability(&ti, "kend", KeyPress::End, keys); // missing
+        capability(&ti, "knp", KeyPress::PageDown, keys);
+        capability(&ti, "kpp", KeyPress::PageUp, keys);
+        capability(&ti, "kent", KeyPress::Enter, keys);
+        // KeyPress::Insert
+        // KeyPress::F(n)
+        // KeyPress::ControlUp, ControlDown, ControlRight, ControlLeft
+        // KeyPress::ShiftUp, ShiftDown, ShiftRight, ShiftLeft
+    }
+}
+fn capability(
+    ti: &terminfo::TermInfo,
+    cap: &str,
+    key: KeyPress,
+    keys: &mut HashMap<Vec<u8>, KeyPress>,
+) {
+    if let Some(seq) = ti.strings.get(cap) {
+        keys.insert(seq.to_vec(), key);
+    }
+}
+
+#[allow(dead_code)]
+fn stty_keys(keys: &mut HashMap<Vec<u8>, KeyPress>) {
+    if let Ok(termios) = termios::tcgetattr(STDIN_FILENO) {
+        // VEOF: KeyPress::Ctrl('D')
+        keys.insert(
+            get_stty(&termios, SpecialCharacterIndices::VERASE),
+            KeyPress::Backspace,
+        );
+        // VINTR: KeyPress::Ctrl('C')
+        keys.insert(
+            get_stty(&termios, SpecialCharacterIndices::VKILL),
+            KeyPress::KillLine,
+        );
+        // VLNEXT: KeyPress::Ctrl('V')
+        // VSUSP: KeyPress::Ctrl('Z')
+        // VWERASE: KeyPress::Ctrl('W')
+    }
+}
+#[allow(dead_code)]
+fn get_stty(termios: &termios::Termios, idx: SpecialCharacterIndices) -> Vec<u8> {
+    vec![termios.control_chars[idx as usize]]
 }
 
 #[cfg(unix)]

@@ -25,6 +25,8 @@ extern crate log;
 #[cfg(unix)]
 extern crate nix;
 extern crate std_unicode;
+#[cfg(unix)]
+extern crate term;
 extern crate unicode_segmentation;
 extern crate unicode_width;
 #[cfg(windows)]

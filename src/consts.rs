@@ -18,6 +18,7 @@ pub enum KeyPress {
     F(u8),
     Home,
     Insert,
+    KillLine,
     Left,
     Meta(char),
     Null,
