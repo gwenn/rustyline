@@ -3,7 +3,8 @@ use std::iter::IntoIterator;
 use std::slice::Iter;
 use std::vec::IntoIter;
 
-use super::{truncate, Position, RawMode, RawReader, Renderer, Term};
+use super::{truncate, RawMode, RawReader, Renderer, Term};
+use crate::cache::Position;
 use crate::config::{ColorMode, Config, OutputStreamType};
 use crate::error::ReadlineError;
 use crate::highlight::Highlighter;

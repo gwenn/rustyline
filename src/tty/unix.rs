@@ -14,7 +14,8 @@ use nix::sys::termios::SetArg;
 use unicode_segmentation::UnicodeSegmentation;
 use utf8parse::{Parser, Receiver};
 
-use super::{truncate, width, Position, RawMode, RawReader, Renderer, Term};
+use super::{truncate, width, RawMode, RawReader, Renderer, Term};
+use crate::cache::Position;
 use crate::config::{ColorMode, Config, OutputStreamType};
 use crate::error;
 use crate::highlight::Highlighter;

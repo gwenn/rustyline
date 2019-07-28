@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::cache::Position;
 use crate::config::{ColorMode, Config, OutputStreamType};
 use crate::highlight::Highlighter;
 use crate::keys::KeyPress;
@@ -24,12 +25,6 @@ pub trait RawReader {
     fn next_char(&mut self) -> Result<char>;
     /// Bracketed paste
     fn read_pasted_text(&mut self) -> Result<String>;
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct Position {
-    pub col: usize,
-    pub row: usize,
 }
 
 /// Display prompt, line and cursor in terminal output

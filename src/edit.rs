@@ -7,12 +7,13 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use super::{Context, Helper, Result};
+use crate::cache::Position;
 use crate::highlight::Highlighter;
 use crate::history::Direction;
 use crate::keymap::{Anchor, At, CharSearch, Cmd, Movement, RepeatCount, Word};
 use crate::keymap::{InputState, Refresher};
 use crate::line_buffer::{LineBuffer, WordAction, MAX_LINE};
-use crate::tty::{Position, Renderer, Term, Terminal};
+use crate::tty::{Renderer, Term, Terminal};
 use crate::undo::Changeset;
 
 /// Represent the state during line editing.

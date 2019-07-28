@@ -23,6 +23,7 @@ extern crate log;
 #[cfg(unix)]
 extern crate nix;
 
+mod cache;
 pub mod completion;
 pub mod config;
 mod edit;

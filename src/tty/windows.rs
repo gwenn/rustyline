@@ -8,7 +8,8 @@ use winapi::shared::minwindef::{DWORD, WORD};
 use winapi::um::winnt::{CHAR, HANDLE};
 use winapi::um::{consoleapi, handleapi, processenv, winbase, wincon, winuser};
 
-use super::{truncate, Position, RawMode, RawReader, Renderer, Term};
+use super::{truncate, RawMode, RawReader, Renderer, Term};
+use crate::cache::Position;
 use crate::config::OutputStreamType;
 use crate::config::{ColorMode, Config};
 use crate::error;
