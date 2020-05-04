@@ -29,6 +29,7 @@ mod keys;
 mod kill_ring;
 mod layout;
 pub mod line_buffer;
+pub mod prompt;
 mod tty;
 mod undo;
 pub mod validate;
@@ -58,15 +59,16 @@ use crate::keymap::{InputState, Refresher};
 pub use crate::keys::KeyPress;
 use crate::kill_ring::{KillRing, Mode};
 use crate::line_buffer::WordAction;
+pub use crate::prompt::Prompt;
 use crate::validate::Validator;
 
 /// The error type for I/O and Linux Syscalls (Errno)
 pub type Result<T> = result::Result<T, error::ReadlineError>;
 
 /// Completes the line/word
-fn complete_line<H: Helper>(
+fn complete_line<H: Helper, P: Prompt + ?Sized>(
     rdr: &mut <Terminal as Term>::Reader,
-    s: &mut State<'_, '_, H>,
+    s: &mut State<'_, '_, H, P>,
     input_state: &mut InputState,
     config: &Config,
 ) -> Result<Option<Cmd>> {
@@ -231,7 +233,7 @@ fn complete_line<H: Helper>(
 }
 
 /// Completes the current hint
-fn complete_hint_line<H: Helper>(s: &mut State<'_, '_, H>) -> Result<()> {
+fn complete_hint_line<H: Helper, P: Prompt + ?Sized>(s: &mut State<'_, '_, H, P>) -> Result<()> {
     let hint = match s.hint.as_ref() {
         Some(hint) => hint,
         None => return Ok(()),
@@ -244,9 +246,9 @@ fn complete_hint_line<H: Helper>(s: &mut State<'_, '_, H>) -> Result<()> {
     Ok(())
 }
 
-fn page_completions<C: Candidate, H: Helper>(
+fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
     rdr: &mut <Terminal as Term>::Reader,
-    s: &mut State<'_, '_, H>,
+    s: &mut State<'_, '_, H, P>,
     input_state: &mut InputState,
     candidates: &[C],
 ) -> Result<Option<Cmd>> {
@@ -324,9 +326,9 @@ fn page_completions<C: Candidate, H: Helper>(
 }
 
 /// Incremental search
-fn reverse_incremental_search<H: Helper>(
+fn reverse_incremental_search<H: Helper, P: Prompt + ?Sized>(
     rdr: &mut <Terminal as Term>::Reader,
-    s: &mut State<'_, '_, H>,
+    s: &mut State<'_, '_, H, P>,
     input_state: &mut InputState,
     history: &History,
 ) -> Result<Option<Cmd>> {
@@ -412,8 +414,8 @@ fn reverse_incremental_search<H: Helper>(
 /// Handles reading and editing the readline buffer.
 /// It will also handle special inputs in an appropriate fashion
 /// (e.g., C-c will exit readline)
-fn readline_edit<H: Helper>(
-    prompt: &str,
+fn readline_edit<H: Helper, P: Prompt + ?Sized>(
+    prompt: &P,
     initial: Option<(&str, &str)>,
     editor: &mut Editor<H>,
     original_mode: &tty::Mode,
@@ -687,8 +689,8 @@ impl Drop for Guard<'_> {
 
 /// Readline method that will enable RAW mode, call the `readline_edit()`
 /// method and disable raw mode
-fn readline_raw<H: Helper>(
-    prompt: &str,
+fn readline_raw<H: Helper, P: Prompt + ?Sized>(
+    prompt: &P,
     initial: Option<(&str, &str)>,
     editor: &mut Editor<H>,
 ) -> Result<String> {
@@ -798,7 +800,7 @@ impl<H: Helper> Editor<H> {
     /// terminal.
     /// Otherwise (e.g., if `stdin` is a pipe or the terminal is not supported),
     /// it uses file-style interaction.
-    pub fn readline(&mut self, prompt: &str) -> Result<String> {
+    pub fn readline<P: Prompt + ?Sized>(&mut self, prompt: &P) -> Result<String> {
         self.readline_with(prompt, None)
     }
 
@@ -813,12 +815,16 @@ impl<H: Helper> Editor<H> {
         self.readline_with(prompt, Some(initial))
     }
 
-    fn readline_with(&mut self, prompt: &str, initial: Option<(&str, &str)>) -> Result<String> {
+    fn readline_with<P: Prompt + ?Sized>(
+        &mut self,
+        prompt: &P,
+        initial: Option<(&str, &str)>,
+    ) -> Result<String> {
         if self.term.is_unsupported() {
             debug!(target: "rustyline", "unsupported terminal");
             // Write prompt and flush it to stdout
             let mut stdout = io::stdout();
-            stdout.write_all(prompt.as_bytes())?;
+            stdout.write_all(prompt.get_prompt(&()).as_bytes())?;
             stdout.flush()?;
 
             readline_direct()

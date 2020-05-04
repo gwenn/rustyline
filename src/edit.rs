@@ -14,15 +14,16 @@ use crate::keymap::{Anchor, At, CharSearch, Cmd, Movement, RepeatCount, Word};
 use crate::keymap::{InputState, Invoke, Refresher};
 use crate::layout::{Layout, Position};
 use crate::line_buffer::{LineBuffer, WordAction, MAX_LINE};
+use crate::prompt::Prompt;
 use crate::tty::{Renderer, Term, Terminal};
 use crate::undo::Changeset;
 use crate::validate::{ValidationContext, ValidationResult};
 
 /// Represent the state during line editing.
 /// Implement rendering.
-pub struct State<'out, 'prompt, H: Helper> {
+pub struct State<'out, 'prompt, H: Helper, P: Prompt + ?Sized> {
     pub out: &'out mut <Terminal as Term>::Writer,
-    prompt: &'prompt str,  // Prompt to display (rl_prompt)
+    prompt: &'prompt P,    // Prompt to display (rl_prompt)
     prompt_size: Position, // Prompt Unicode/visible width and height
     pub line: LineBuffer,  // Edited line buffer
     pub layout: Layout,
@@ -41,13 +42,13 @@ enum Info<'m> {
     Msg(Option<&'m str>),
 }
 
-impl<'out, 'prompt, H: Helper> State<'out, 'prompt, H> {
+impl<'out, 'prompt, H: Helper, P: Prompt + ?Sized> State<'out, 'prompt, H, P> {
     pub fn new(
         out: &'out mut <Terminal as Term>::Writer,
-        prompt: &'prompt str,
+        prompt: &'prompt P,
         helper: Option<&'out H>,
         ctx: Context<'out>,
-    ) -> State<'out, 'prompt, H> {
+    ) -> State<'out, 'prompt, H, P> {
         let prompt_size = out.calculate_position(prompt, Position::default());
         State {
             out,
@@ -135,7 +136,7 @@ impl<'out, 'prompt, H: Helper> State<'out, 'prompt, H> {
 
     fn refresh(
         &mut self,
-        prompt: &str,
+        prompt: &P,
         prompt_size: Position,
         default_prompt: bool,
         info: Info<'_>,
@@ -231,13 +232,13 @@ impl<'out, 'prompt, H: Helper> State<'out, 'prompt, H> {
     }
 }
 
-impl<'out, 'prompt, H: Helper> Invoke for State<'out, 'prompt, H> {
+impl<'out, 'prompt, H: Helper, P: Prompt + ?Sized> Invoke for State<'out, 'prompt, H, P> {
     fn input(&self) -> &str {
         self.line.as_str()
     }
 }
 
-impl<'out, 'prompt, H: Helper> Refresher for State<'out, 'prompt, H> {
+impl<'out, 'prompt, H: Helper, P: Prompt + ?Sized> Refresher for State<'out, 'prompt, H, P> {
     fn refresh_line(&mut self) -> Result<()> {
         let prompt_size = self.prompt_size;
         self.hint();
@@ -280,10 +281,10 @@ impl<'out, 'prompt, H: Helper> Refresher for State<'out, 'prompt, H> {
     }
 }
 
-impl<'out, 'prompt, H: Helper> fmt::Debug for State<'out, 'prompt, H> {
+impl<'out, 'prompt, H: Helper, P: Prompt + ?Sized> fmt::Debug for State<'out, 'prompt, H, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("State")
-            .field("prompt", &self.prompt)
+            .field("prompt", &self.prompt.get_prompt(&()))
             .field("prompt_size", &self.prompt_size)
             .field("buf", &self.line)
             .field("cols", &self.out.get_columns())
@@ -293,7 +294,7 @@ impl<'out, 'prompt, H: Helper> fmt::Debug for State<'out, 'prompt, H> {
     }
 }
 
-impl<'out, 'prompt, H: Helper> State<'out, 'prompt, H> {
+impl<'out, 'prompt, H: Helper, P: Prompt + ?Sized> State<'out, 'prompt, H, P> {
     pub fn clear_screen(&mut self) -> Result<()> {
         self.out.clear_screen()?;
         self.layout.cursor = Position::default();
@@ -661,7 +662,7 @@ pub fn init_state<'out, H: Helper>(
     pos: usize,
     helper: Option<&'out H>,
     history: &'out crate::history::History,
-) -> State<'out, 'static, H> {
+) -> State<'out, 'static, H, str> {
     State {
         out,
         prompt: "",
