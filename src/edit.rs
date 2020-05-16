@@ -90,7 +90,7 @@ impl<'out, 'prompt, H: Helper, P: Prompt + ?Sized> State<'out, 'prompt, H, P> {
                 self.refresh_line()?;
                 continue;
             }
-            if let Ok(Cmd::Replace(_, _)) = rc {
+            if let Ok(Cmd::Replace(..)) = rc {
                 self.changes.borrow_mut().begin();
             }
             return rc;
