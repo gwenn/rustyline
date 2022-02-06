@@ -92,6 +92,7 @@ impl RawMode for ConsoleMode {
         if let Some(original_stdstream_mode) = self.original_stdstream_mode {
             if let Some(out) = self.out {
                 write_and_flush(out, BRACKETED_PASTE_OFF)?;
+                debug!(target: "rustyline", "Turned bracketed paste off");
             }
             check(unsafe {
                 consoleapi::SetConsoleMode(self.stdstream_handle, original_stdstream_mode)
@@ -104,12 +105,16 @@ impl RawMode for ConsoleMode {
 /// Console input reader
 pub struct ConsoleRawReader {
     handle: HANDLE,
+    enable_bracketed_paste: bool,
 }
 
 impl ConsoleRawReader {
-    pub fn create() -> Result<ConsoleRawReader> {
+    pub fn create(enable_bracketed_paste: bool) -> Result<ConsoleRawReader> {
         let handle = get_std_handle(STDIN_FILENO)?;
-        Ok(ConsoleRawReader { handle })
+        Ok(ConsoleRawReader {
+            handle,
+            enable_bracketed_paste,
+        })
     }
 }
 
@@ -124,6 +129,9 @@ impl RawReader for ConsoleRawReader {
         let mut rec: wincon::INPUT_RECORD = unsafe { mem::zeroed() };
         let mut count = 0;
         let mut surrogate = 0;
+        let mut esc_seq_len = 0;
+        let mut esc_seq = ['\0'; 5];
+
         loop {
             // TODO GetNumberOfConsoleInputEvents
             check(unsafe { consoleapi::ReadConsoleInputW(self.handle, &mut rec, 1, &mut count) })?;
@@ -203,7 +211,7 @@ impl RawReader for ConsoleRawReader {
                     K::UnknownEscSeq
                 }
             };
-            let key = if key_code != K::UnknownEscSeq {
+            let mut key = if key_code != K::UnknownEscSeq {
                 KeyEvent(key_code, mods)
             } else if utf16 == 27 {
                 KeyEvent(K::Esc, mods) // FIXME dead code ?
@@ -225,13 +233,78 @@ impl RawReader for ConsoleRawReader {
                 let c = rc?;
                 KeyEvent::new(c, mods)
             };
+
             debug!(target: "rustyline", "wVirtualKeyCode: {:#x}, utf16: {:#x}, dwControlKeyState: {:#x} => key: {:?}", key_event.wVirtualKeyCode, utf16, key_event.dwControlKeyState, key);
+
+            if self.enable_bracketed_paste {
+                if esc_seq_len == 0 && key == KeyEvent(K::Esc, M::NONE) {
+                    esc_seq[esc_seq_len] = '\x1b';
+                    esc_seq_len += 1;
+                    continue;
+                } else if esc_seq_len > 0 {
+                    match (esc_seq, key) {
+                        (
+                            ['\x1b', '\0', '\0', '\0', '\0'],
+                            KeyEvent(K::Char(ch @ '['), M::NONE),
+                        )
+                        | (['\x1b', '[', '\0', '\0', '\0'], KeyEvent(K::Char(ch @ '2'), M::NONE))
+                        | (['\x1b', '[', '2', '\0', '\0'], KeyEvent(K::Char(ch @ '0'), M::NONE))
+                        | (['\x1b', '[', '2', '0', '\0'], KeyEvent(K::Char(ch @ '0'), M::NONE))
+                        | (['\x1b', '[', '2', '0', '\0'], KeyEvent(K::Char(ch @ '1'), M::NONE)) => {
+                            esc_seq[esc_seq_len] = ch;
+                            esc_seq_len += 1;
+                            continue;
+                        }
+                        (['\x1b', '[', '2', '0', '0'], KeyEvent(K::Char('~'), M::NONE)) => {
+                            debug!(target: "rustyline", "Bracketed paste start");
+                            key = KeyEvent(K::BracketedPasteStart, M::NONE);
+                        }
+                        (['\x1b', '[', '2', '0', '1'], KeyEvent(K::Char('~'), M::NONE)) => {
+                            debug!(target: "rustyline", "Bracketed paste end");
+                            key = KeyEvent(K::BracketedPasteEnd, M::NONE);
+                        }
+                        (_, KeyEvent(K::Char(ch), M::NONE)) => {
+                            debug!(target: "rustyline", "unsupported esc sequence: \\E{}{}", esc_seq[1..esc_seq_len].iter().cloned().collect::<String>(), ch);
+                            key = KeyEvent(K::UnknownEscSeq, M::NONE);
+                        }
+                        _ => {
+                            debug!(target: "rustyline", "unsupported esc sequence: \\E{}", esc_seq[1..esc_seq_len].iter().cloned().collect::<String>());
+                            key = KeyEvent(K::UnknownEscSeq, M::NONE);
+                        }
+                    }
+                }
+            }
+
             return Ok(key);
         }
     }
 
     fn read_pasted_text(&mut self) -> Result<String> {
-        Ok(clipboard_win::get_clipboard_string()?)
+        if self.enable_bracketed_paste {
+            let mut buffer = String::new();
+
+            loop {
+                match self.next_key(true)? {
+                    KeyEvent(K::BracketedPasteEnd, _) => {
+                        let buffer = buffer.replace("\r\n", "\n");
+                        let buffer = buffer.replace('\r', "\n");
+                        return Ok(buffer);
+                    }
+                    KeyEvent(K::Char(ch), M::NONE) => {
+                        buffer.push(ch);
+                    }
+                    KeyEvent(K::Char('M'), M::CTRL) => {
+                        buffer.push('\r');
+                    }
+                    KeyEvent(K::Char('J'), M::CTRL) => {
+                        buffer.push('\n');
+                    }
+                    _ => (),
+                }
+            }
+        } else {
+            Ok(clipboard_win::get_clipboard_string()?)
+        }
     }
 
     fn find_binding(&self, _: &KeyEvent) -> Option<Cmd> {
@@ -624,7 +697,6 @@ impl Term for Console {
         raw |= wincon::ENABLE_INSERT_MODE;
         raw |= wincon::ENABLE_QUICK_EDIT_MODE;
         raw |= wincon::ENABLE_WINDOW_INPUT;
-        check(unsafe { consoleapi::SetConsoleMode(self.stdin_handle, raw) })?;
 
         let mut out = None;
         let original_stdstream_mode = if self.stdstream_isatty {
@@ -658,13 +730,17 @@ impl Term for Console {
                 debug!(target: "rustyline", "ansi_colors_supported: {}", self.ansi_colors_supported);
             }
             if self.ansi_colors_supported && self.enable_bracketed_paste {
+                raw |= wincon::ENABLE_VIRTUAL_TERMINAL_INPUT;
                 write_and_flush(self.stream_type, BRACKETED_PASTE_ON)?;
                 out = Some(self.stream_type);
+                debug!(target: "rustyline", "Turned bracketed paste on");
             }
             Some(original_stdstream_mode)
         } else {
             None
         };
+
+        check(unsafe { consoleapi::SetConsoleMode(self.stdin_handle, raw) })?;
 
         Ok((
             ConsoleMode {
@@ -679,7 +755,7 @@ impl Term for Console {
     }
 
     fn create_reader(&self, _: &Config, _: ConsoleKeyMap) -> Result<ConsoleRawReader> {
-        ConsoleRawReader::create()
+        ConsoleRawReader::create(self.enable_bracketed_paste)
     }
 
     fn create_writer(&self) -> ConsoleRenderer {
