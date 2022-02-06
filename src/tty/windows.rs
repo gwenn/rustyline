@@ -346,22 +346,18 @@ impl EscapeCodeBuilder {
             // Incomplete
             ([ESC, XX, XX, XX, XX, XX], E(K::Char(ch @ ('[' | 'O')), M::NONE))
             | ([ESC, '[', XX, XX, XX, XX], E(K::Char(ch @ ('1' | '2')), M::NONE))
+            | ([ESC, '[', XX, XX, XX, XX], E(K::Char(ch @ (PGUP | PGDN | DEL /*| INS*/)), M::NONE))
             | ([ESC, '[', '1', XX, XX, XX], E(K::Char(ch @ ';'), M::NONE))
             | ([ESC, '[', '1', ';', XX, XX], E(K::Char(ch @ '2'..='8'), M::NONE))
             | ([ESC, '[', '1', XX, XX, XX], E(K::Char(ch @ ('5' | '7' | '8' | '9')), M::NONE))
             | ([ESC, '[', '2', XX, XX, XX], E(K::Char(ch @ ('0' | '1' | '3' | '4')), M::NONE))
-            | (
-                [ESC, '[', '1', '5' | '7' | '8' | '9', XX, XX]
-                | [ESC, '[', '2', '0' | '1' | '3' | '4', XX, XX],
-                E(K::Char(ch @ ';'), M::NONE),
-            )
-            | (
-                [ESC, '[', '1', '5' | '7' | '8' | '9', ';', XX]
-                | [ESC, '[', '2', '0' | '1' | '3' | '4', ';', XX],
-                E(K::Char(ch @ ('2'..='8')), M::NONE),
-            )
-            | ([ESC, '[', '2', '0', XX, XX], E(K::Char(ch @ '0'), M::NONE))
-            | ([ESC, '[', '2', '0', XX, XX], E(K::Char(ch @ '1'), M::NONE)) => {
+            | ([ESC, '[', PGUP | PGDN | DEL | INS, XX, XX, XX], E(K::Char(ch @ ';'), M::NONE))
+            | ([ESC, '[', PGUP | PGDN | DEL | INS, ';', XX, XX], E(K::Char(ch @ '2'..='8'), M::NONE))
+            | ([ESC, '[', '1', '5' | '7' | '8' | '9', XX, XX], E(K::Char(ch @ ';'), M::NONE))
+            | ([ESC, '[', '2', '0' | '1' | '3' | '4', XX, XX], E(K::Char(ch @ ';'), M::NONE))
+            | ([ESC, '[', '1', '5' | '7' | '8' | '9', ';', XX], E(K::Char(ch @ ('2'..='8')), M::NONE))
+            | ([ESC, '[', '2', '0' | '1' | '3' | '4', ';', XX], E(K::Char(ch @ ('2'..='8')), M::NONE))
+            | ([ESC, '[', '2', '0', XX, XX], E(K::Char(ch @ ('0' | '1')), M::NONE)) => {
                 self.esc_seq[self.esc_seq_len] = ch;
                 self.esc_seq_len += 1;
                 None
@@ -370,10 +366,7 @@ impl EscapeCodeBuilder {
             // \E[...
             (
                 [ESC, '[', XX, XX, XX, XX],
-                E(
-                    K::Char(ch @ (UP | DOWN | RIGHT | LEFT | END | HOME | DEL | INS | PGUP | PGDN)),
-                    M::NONE,
-                ),
+                E(K::Char(ch @ (UP | DOWN | RIGHT | LEFT | END | HOME)), M::NONE),
             ) => {
                 let key = E(
                     match ch {
@@ -383,6 +376,17 @@ impl EscapeCodeBuilder {
                         LEFT => K::Left,
                         END => K::End,
                         HOME => K::Home,
+                        _ => unreachable!(),
+                    },
+                    M::NONE,
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
+            // \E[...~
+            ([ESC, '[', ch @ (PGUP | PGDN | DEL | INS), XX, XX, XX], E(K::Char('~'), M::NONE)) => {
+                let key = E(
+                    match ch {
                         DEL => K::Delete,
                         INS => K::Insert,
                         PGUP => K::PageUp,
@@ -399,18 +403,9 @@ impl EscapeCodeBuilder {
                 [ESC, '[', '1', ';', meta @ ('2'..='8'), XX],
                 E(
                     K::Char(
-                        ch @ (UP
-                        | DOWN
-                        | RIGHT
-                        | LEFT
-                        | END
-                        | HOME
-                        | DEL
-                        | INS
-                        | PGUP
-                        | PGDN
-                        | 'p'..='y'
-                        | 'P'..='S'),
+                        ch @ (UP | DOWN | RIGHT | LEFT | END | HOME | PGUP | PGDN | DEL | INS)
+                        | ch @ 'p'..='y'
+                        | ch @ 'P'..='S',
                     ),
                     M::NONE,
                 ),
@@ -509,6 +504,24 @@ impl EscapeCodeBuilder {
                 debug!(target: "rustyline", "Key = {:?}", key);
                 Some(key)
             }
+            // \E[...;{2345678}
+            (
+                [ESC, '[', ch, ';', meta @ ('2'..='8'), XX],
+                E(K::Char('~'), M::NONE),
+            ) => {
+                let key = E(
+                    match ch {
+                        DEL => K::Delete,
+                        INS => K::Insert,
+                        PGUP => K::PageUp,
+                        PGDN => K::PageDown,
+                        _ => unreachable!(),
+                    },
+                    map_escape_meta(meta),
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
             // \E[200~
             ([ESC, '[', '2', '0', '0', XX], E(K::Char('~'), M::NONE)) => {
                 debug!(target: "rustyline", "Bracketed paste start");
@@ -530,6 +543,7 @@ impl EscapeCodeBuilder {
         }
     }
 }
+
 pub struct ConsoleRenderer {
     out: OutputStreamType,
     handle: HANDLE,
