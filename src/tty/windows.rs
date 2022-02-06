@@ -271,10 +271,38 @@ impl RawReader for ConsoleRawReader {
             debug!(target: "rustyline", "wVirtualKeyCode: {:#x}, utf16: {:#x}, dwControlKeyState: {:#x} => key: {:?}", key_event.wVirtualKeyCode, utf16, key_event.dwControlKeyState, key);
 
             if self.enable_bracketed_paste {
-                if let Some(k) = esc.on_key(key) {
-                    key = k;
+                let esc_processing = if !esc.is_processing() && key == E(K::Esc, M::NONE) {
+                    // Check if it is a stand-alone Escape
+                    check(unsafe {
+                        consoleapi::GetNumberOfConsoleInputEvents(self.handle, &mut count)
+                    })?;
+                    if count > 0 {
+                        check(unsafe {
+                            consoleapi::PeekConsoleInputA(self.handle, &mut rec, 1, &mut count)
+                        })?;
+
+                        if count > 0 && rec.EventType == wincon::KEY_EVENT {
+                            let key_event = unsafe { rec.Event.KeyEvent() };
+                            // It is a stand-alone Escape if the next event is key-up of that Esc key!
+                            key_event.bKeyDown != 0 || key_event.wVirtualKeyCode != 0x1b
+                        } else {
+                            // If the next event is not a key event then it is not an escape sequence
+                            false
+                        }
+                    } else {
+                        // If there is no next event, then that key-press is likely a stand-alone Escape
+                        false
+                    }
                 } else {
-                    continue;
+                    true
+                };
+
+                if esc_processing {
+                    if let Some(k) = esc.on_key(key) {
+                        key = k;
+                    } else {
+                        continue;
+                    }
                 }
             }
 
@@ -331,8 +359,12 @@ impl EscapeCodeBuilder {
         }
     }
 
+    fn is_processing(&self) -> bool {
+        self.esc_seq_len > 0
+    }
+
     fn on_key(&mut self, key: E) -> Option<E> {
-        if self.esc_seq_len == 0 {
+        if !self.is_processing() {
             return if key == E(K::Esc, M::NONE) {
                 self.esc_seq[self.esc_seq_len] = ESC;
                 self.esc_seq_len += 1;
