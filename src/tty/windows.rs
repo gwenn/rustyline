@@ -21,7 +21,7 @@ use super::{
 };
 use crate::config::{BellStyle, ColorMode, Config, OutputStreamType};
 use crate::highlight::Highlighter;
-use crate::keys::{KeyCode as K, KeyEvent, Modifiers as M};
+use crate::keys::{KeyCode as K, KeyEvent as E, Modifiers as M};
 use crate::layout::{Layout, Position};
 use crate::line_buffer::LineBuffer;
 use crate::{error, Cmd, Result};
@@ -29,6 +29,41 @@ use crate::{error, Cmd, Result};
 const STDIN_FILENO: DWORD = winbase::STD_INPUT_HANDLE;
 const STDOUT_FILENO: DWORD = winbase::STD_OUTPUT_HANDLE;
 const STDERR_FILENO: DWORD = winbase::STD_ERROR_HANDLE;
+
+const XX: char = '\0';
+const ESC: char = '\x1b';
+
+const UP: char = 'A';
+const DOWN: char = 'B';
+const RIGHT: char = 'C';
+const LEFT: char = 'D';
+const END: char = 'F';
+const HOME: char = 'H';
+const INS: char = '2';
+const DEL: char = '3';
+const PGUP: char = '5';
+const PGDN: char = '6';
+
+const SHIFT: char = '2';
+const ALT: char = '3';
+const ALT_SHIFT: char = '4';
+const CTRL: char = '5';
+const CTRL_SHIFT: char = '6';
+const CTRL_ALT: char = '7';
+const CTRL_ALT_SHIFT: char = '8';
+
+fn map_escape_meta(ch: char) -> M {
+    match ch {
+        SHIFT => M::SHIFT,
+        ALT => M::ALT,
+        ALT_SHIFT => M::ALT_SHIFT,
+        CTRL => M::CTRL,
+        CTRL_SHIFT => M::CTRL_SHIFT,
+        CTRL_ALT => M::CTRL_ALT,
+        CTRL_ALT_SHIFT => M::CTRL_ALT_SHIFT,
+        _ => unreachable!(),
+    }
+}
 
 fn get_std_handle(fd: DWORD) -> Result<HANDLE> {
     let handle = unsafe { processenv::GetStdHandle(fd) };
@@ -92,6 +127,7 @@ impl RawMode for ConsoleMode {
         if let Some(original_stdstream_mode) = self.original_stdstream_mode {
             if let Some(out) = self.out {
                 write_and_flush(out, BRACKETED_PASTE_OFF)?;
+                debug!(target: "rustyline", "Turned bracketed paste off");
             }
             check(unsafe {
                 consoleapi::SetConsoleMode(self.stdstream_handle, original_stdstream_mode)
@@ -104,17 +140,21 @@ impl RawMode for ConsoleMode {
 /// Console input reader
 pub struct ConsoleRawReader {
     handle: HANDLE,
+    enable_bracketed_paste: bool,
 }
 
 impl ConsoleRawReader {
-    pub fn create() -> Result<ConsoleRawReader> {
+    pub fn create(enable_bracketed_paste: bool) -> Result<ConsoleRawReader> {
         let handle = get_std_handle(STDIN_FILENO)?;
-        Ok(ConsoleRawReader { handle })
+        Ok(ConsoleRawReader {
+            handle,
+            enable_bracketed_paste,
+        })
     }
 }
 
 impl RawReader for ConsoleRawReader {
-    fn next_key(&mut self, _: bool) -> Result<KeyEvent> {
+    fn next_key(&mut self, _: bool) -> Result<E> {
         use std::char::decode_utf16;
         use winapi::um::wincon::{
             LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED,
@@ -124,6 +164,8 @@ impl RawReader for ConsoleRawReader {
         let mut rec: wincon::INPUT_RECORD = unsafe { mem::zeroed() };
         let mut count = 0;
         let mut surrogate = 0;
+        let mut esc = EscapeCodeBuilder::new();
+
         loop {
             // TODO GetNumberOfConsoleInputEvents
             check(unsafe { consoleapi::ReadConsoleInputW(self.handle, &mut rec, 1, &mut count) })?;
@@ -203,10 +245,10 @@ impl RawReader for ConsoleRawReader {
                     K::UnknownEscSeq
                 }
             };
-            let key = if key_code != K::UnknownEscSeq {
-                KeyEvent(key_code, mods)
+            let mut key = if key_code != K::UnknownEscSeq {
+                E(key_code, mods)
             } else if utf16 == 27 {
-                KeyEvent(K::Esc, mods) // FIXME dead code ?
+                E(K::Esc, mods) // FIXME dead code ?
             } else {
                 if (0xD800..0xDC00).contains(&utf16) {
                     surrogate = utf16;
@@ -223,19 +265,314 @@ impl RawReader for ConsoleRawReader {
                     return Err(error::ReadlineError::Eof);
                 };
                 let c = rc?;
-                KeyEvent::new(c, mods)
+                E::new(c, mods)
             };
+
             debug!(target: "rustyline", "wVirtualKeyCode: {:#x}, utf16: {:#x}, dwControlKeyState: {:#x} => key: {:?}", key_event.wVirtualKeyCode, utf16, key_event.dwControlKeyState, key);
+
+            if self.enable_bracketed_paste {
+                let esc_processing = if !esc.is_processing() && key == E(K::Esc, M::NONE) {
+                    // Check if it is a stand-alone Escape
+                    check(unsafe {
+                        consoleapi::GetNumberOfConsoleInputEvents(self.handle, &mut count)
+                    })?;
+                    if count > 0 {
+                        check(unsafe {
+                            consoleapi::PeekConsoleInputA(self.handle, &mut rec, 1, &mut count)
+                        })?;
+
+                        if count > 0 && rec.EventType == wincon::KEY_EVENT {
+                            let key_event = unsafe { rec.Event.KeyEvent() };
+                            // It is a stand-alone Escape if the next event is key-up of that Esc key!
+                            key_event.bKeyDown != 0 || key_event.wVirtualKeyCode != 0x1b
+                        } else {
+                            // If the next event is not a key event then it is not an escape sequence
+                            false
+                        }
+                    } else {
+                        // If there is no next event, then that key-press is likely a stand-alone Escape
+                        false
+                    }
+                } else {
+                    true
+                };
+
+                if esc_processing {
+                    if let Some(k) = esc.on_key(key) {
+                        key = k;
+                    } else {
+                        continue;
+                    }
+                }
+            }
+
             return Ok(key);
         }
     }
 
     fn read_pasted_text(&mut self) -> Result<String> {
-        Ok(clipboard_win::get_clipboard_string()?)
+        if self.enable_bracketed_paste {
+            let mut buffer = String::new();
+
+            loop {
+                match self.next_key(true)? {
+                    E(K::BracketedPasteEnd, _) => {
+                        let buffer = buffer.replace("\r\n", "\n");
+                        let buffer = buffer.replace('\r', "\n");
+                        return Ok(buffer);
+                    }
+                    E(K::Char(ch), M::NONE) => {
+                        buffer.push(ch);
+                    }
+                    E(K::Char('I'), M::CTRL) => {
+                        buffer.push('\t');
+                    }
+                    E(K::Char('M'), M::CTRL) => {
+                        buffer.push('\r');
+                    }
+                    E(K::Char('J'), M::CTRL) => {
+                        buffer.push('\n');
+                    }
+                    _ => (),
+                }
+            }
+        } else {
+            Ok(clipboard_win::get_clipboard_string()?)
+        }
     }
 
-    fn find_binding(&self, _: &KeyEvent) -> Option<Cmd> {
+    fn find_binding(&self, _: &E) -> Option<Cmd> {
         None
+    }
+}
+
+struct EscapeCodeBuilder {
+    esc_seq_len: usize,
+    esc_seq: [char; 6],
+}
+
+impl EscapeCodeBuilder {
+    fn new() -> Self {
+        Self {
+            esc_seq_len: 0,
+            esc_seq: [XX; 6],
+        }
+    }
+
+    fn is_processing(&self) -> bool {
+        self.esc_seq_len > 0
+    }
+
+    fn on_key(&mut self, key: E) -> Option<E> {
+        if !self.is_processing() {
+            return if key == E(K::Esc, M::NONE) {
+                self.esc_seq[self.esc_seq_len] = ESC;
+                self.esc_seq_len += 1;
+                None
+            } else {
+                Some(key)
+            };
+        }
+
+        match (self.esc_seq, key) {
+            // Incomplete
+            ([ESC, XX, XX, XX, XX, XX], E(K::Char(ch @ ('[' | 'O')), M::NONE))
+            | ([ESC, '[', XX, XX, XX, XX], E(K::Char(ch @ ('1' | '2')), M::NONE))
+            | ([ESC, '[', XX, XX, XX, XX], E(K::Char(ch @ (PGUP | PGDN | DEL /*| INS*/)), M::NONE))
+            | ([ESC, '[', '1', XX, XX, XX], E(K::Char(ch @ ';'), M::NONE))
+            | ([ESC, '[', '1', ';', XX, XX], E(K::Char(ch @ '2'..='8'), M::NONE))
+            | ([ESC, '[', '1', XX, XX, XX], E(K::Char(ch @ ('5' | '7' | '8' | '9')), M::NONE))
+            | ([ESC, '[', '2', XX, XX, XX], E(K::Char(ch @ ('0' | '1' | '3' | '4')), M::NONE))
+            | ([ESC, '[', PGUP | PGDN | DEL | INS, XX, XX, XX], E(K::Char(ch @ ';'), M::NONE))
+            | ([ESC, '[', PGUP | PGDN | DEL | INS, ';', XX, XX], E(K::Char(ch @ '2'..='8'), M::NONE))
+            | ([ESC, '[', '1', '5' | '7' | '8' | '9', XX, XX], E(K::Char(ch @ ';'), M::NONE))
+            | ([ESC, '[', '2', '0' | '1' | '3' | '4', XX, XX], E(K::Char(ch @ ';'), M::NONE))
+            | ([ESC, '[', '1', '5' | '7' | '8' | '9', ';', XX], E(K::Char(ch @ ('2'..='8')), M::NONE))
+            | ([ESC, '[', '2', '0' | '1' | '3' | '4', ';', XX], E(K::Char(ch @ ('2'..='8')), M::NONE))
+            | ([ESC, '[', '2', '0', XX, XX], E(K::Char(ch @ ('0' | '1')), M::NONE)) => {
+                self.esc_seq[self.esc_seq_len] = ch;
+                self.esc_seq_len += 1;
+                None
+            }
+
+            // \E[...
+            (
+                [ESC, '[', XX, XX, XX, XX],
+                E(K::Char(ch @ (UP | DOWN | RIGHT | LEFT | END | HOME)), M::NONE),
+            ) => {
+                let key = E(
+                    match ch {
+                        UP => K::Up,
+                        DOWN => K::Down,
+                        RIGHT => K::Right,
+                        LEFT => K::Left,
+                        END => K::End,
+                        HOME => K::Home,
+                        _ => unreachable!(),
+                    },
+                    M::NONE,
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
+            // \E[...~
+            ([ESC, '[', ch @ (PGUP | PGDN | DEL | INS), XX, XX, XX], E(K::Char('~'), M::NONE)) => {
+                let key = E(
+                    match ch {
+                        DEL => K::Delete,
+                        INS => K::Insert,
+                        PGUP => K::PageUp,
+                        PGDN => K::PageDown,
+                        _ => unreachable!(),
+                    },
+                    M::NONE,
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
+            // \E[1;{2345678}...
+            (
+                [ESC, '[', '1', ';', meta @ ('2'..='8'), XX],
+                E(
+                    K::Char(
+                        ch @ (UP | DOWN | RIGHT | LEFT | END | HOME | PGUP | PGDN | DEL | INS)
+                        | ch @ 'p'..='y'
+                        | ch @ 'P'..='S',
+                    ),
+                    M::NONE,
+                ),
+            ) => {
+                let key = E(
+                    match ch {
+                        UP => K::Up,
+                        DOWN => K::Down,
+                        RIGHT => K::Right,
+                        LEFT => K::Left,
+                        END => K::End,
+                        HOME => K::Home,
+                        DEL => K::Delete,
+                        INS => K::Insert,
+                        PGUP => K::PageUp,
+                        PGDN => K::PageDown,
+                        'P' => K::F(1),
+                        'Q' => K::F(2),
+                        'R' => K::F(3),
+                        'S' => K::F(4),
+                        'p' => K::Char('0'),
+                        'q' => K::Char('1'),
+                        'r' => K::Char('2'),
+                        's' => K::Char('3'),
+                        't' => K::Char('4'),
+                        'u' => K::Char('5'),
+                        'v' => K::Char('6'),
+                        'w' => K::Char('7'),
+                        'x' => K::Char('8'),
+                        'y' => K::Char('9'),
+                        _ => unreachable!(),
+                    },
+                    map_escape_meta(meta),
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
+            // \EO{PQRS}
+            ([ESC, 'O', XX, XX, XX, XX], E(K::Char(ch @ ('P' | 'Q' | 'R' | 'S')), M::NONE)) => {
+                let key = E(
+                    match ch {
+                        'P' => K::F(1),
+                        'Q' => K::F(2),
+                        'R' => K::F(3),
+                        'S' => K::F(4),
+                        _ => unreachable!(),
+                    },
+                    M::NONE,
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
+            // \E[1{5789}~ or \E[2{0134}~
+            (
+                [ESC, '[', x @ '1', ch @ ('5' | '7' | '8' | '9'), XX, XX]
+                | [ESC, '[', x @ '2', ch @ ('0' | '1' | '3' | '4'), XX, XX],
+                E(K::Char('~'), M::NONE),
+            ) => {
+                let key = E(
+                    match (x, ch) {
+                        ('1', '5') => K::F(5),
+                        ('1', '7') => K::F(6),
+                        ('1', '8') => K::F(7),
+                        ('1', '9') => K::F(8),
+                        ('2', '0') => K::F(9),
+                        ('2', '1') => K::F(10),
+                        ('2', '3') => K::F(11),
+                        ('2', '4') => K::F(12),
+                        _ => unreachable!(),
+                    },
+                    M::NONE,
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
+            // \E[1{5789};{2345678} or \E[2{0134};{2345678}
+            (
+                [ESC, '[', x @ '1', ch @ ('5' | '7' | '8' | '9'), ';', meta @ ('2'..='8')]
+                | [ESC, '[', x @ '2', ch @ ('0' | '1' | '3' | '4'), ';', meta @ ('2'..='8')],
+                E(K::Char('~'), M::NONE),
+            ) => {
+                let key = E(
+                    match (x, ch) {
+                        ('1', '5') => K::F(5),
+                        ('1', '7') => K::F(6),
+                        ('1', '8') => K::F(7),
+                        ('1', '9') => K::F(8),
+                        ('2', '0') => K::F(9),
+                        ('2', '1') => K::F(10),
+                        ('2', '3') => K::F(11),
+                        ('2', '4') => K::F(12),
+                        _ => unreachable!(),
+                    },
+                    map_escape_meta(meta),
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
+            // \E[...;{2345678}
+            (
+                [ESC, '[', ch, ';', meta @ ('2'..='8'), XX],
+                E(K::Char('~'), M::NONE),
+            ) => {
+                let key = E(
+                    match ch {
+                        DEL => K::Delete,
+                        INS => K::Insert,
+                        PGUP => K::PageUp,
+                        PGDN => K::PageDown,
+                        _ => unreachable!(),
+                    },
+                    map_escape_meta(meta),
+                );
+                debug!(target: "rustyline", "Key = {:?}", key);
+                Some(key)
+            }
+            // \E[200~
+            ([ESC, '[', '2', '0', '0', XX], E(K::Char('~'), M::NONE)) => {
+                debug!(target: "rustyline", "Bracketed paste start");
+                Some(E(K::BracketedPasteStart, M::NONE))
+            }
+            // \E[201~
+            ([ESC, '[', '2', '0', '1', XX], E(K::Char('~'), M::NONE)) => {
+                debug!(target: "rustyline", "Bracketed paste end");
+                Some(E(K::BracketedPasteEnd, M::NONE))
+            }
+            (_, E(K::Char(ch), M::NONE)) => {
+                debug!(target: "rustyline", "unsupported esc sequence: \\E{}{}", self.esc_seq[1..self.esc_seq_len].iter().cloned().collect::<String>(), ch);
+                Some(E(K::UnknownEscSeq, M::NONE))
+            }
+            _ => {
+                debug!(target: "rustyline", "unsupported esc sequence: \\E{}", self.esc_seq[1..self.esc_seq_len].iter().cloned().collect::<String>());
+                Some(E(K::UnknownEscSeq, M::NONE))
+            }
+        }
     }
 }
 
@@ -624,7 +961,6 @@ impl Term for Console {
         raw |= wincon::ENABLE_INSERT_MODE;
         raw |= wincon::ENABLE_QUICK_EDIT_MODE;
         raw |= wincon::ENABLE_WINDOW_INPUT;
-        check(unsafe { consoleapi::SetConsoleMode(self.stdin_handle, raw) })?;
 
         let mut out = None;
         let original_stdstream_mode = if self.stdstream_isatty {
@@ -658,13 +994,17 @@ impl Term for Console {
                 debug!(target: "rustyline", "ansi_colors_supported: {}", self.ansi_colors_supported);
             }
             if self.ansi_colors_supported && self.enable_bracketed_paste {
+                raw |= wincon::ENABLE_VIRTUAL_TERMINAL_INPUT;
                 write_and_flush(self.stream_type, BRACKETED_PASTE_ON)?;
                 out = Some(self.stream_type);
+                debug!(target: "rustyline", "Turned bracketed paste on");
             }
             Some(original_stdstream_mode)
         } else {
             None
         };
+
+        check(unsafe { consoleapi::SetConsoleMode(self.stdin_handle, raw) })?;
 
         Ok((
             ConsoleMode {
@@ -679,7 +1019,7 @@ impl Term for Console {
     }
 
     fn create_reader(&self, _: &Config, _: ConsoleKeyMap) -> Result<ConsoleRawReader> {
-        ConsoleRawReader::create()
+        ConsoleRawReader::create(self.enable_bracketed_paste)
     }
 
     fn create_writer(&self) -> ConsoleRenderer {

@@ -211,7 +211,7 @@ impl Default for Config {
             tab_stop: 8,
             indent_size: 2,
             check_cursor_position: false,
-            enable_bracketed_paste: true,
+            enable_bracketed_paste: !cfg!(windows),
         }
     }
 }
