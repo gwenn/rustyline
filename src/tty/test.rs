@@ -3,15 +3,16 @@ use std::iter::IntoIterator;
 use std::slice::Iter;
 use std::vec::IntoIter;
 
-use super::{RawMode, RawReader, Renderer, Term};
-use crate::config::{BellStyle, ColorMode, Config, OutputStreamType};
+use super::{Event, ExternalPrinter, RawMode, RawReader, Renderer, Term};
+use crate::config::{Behavior, BellStyle, ColorMode, Config};
 use crate::error::ReadlineError;
 use crate::highlight::Highlighter;
-use crate::keys::KeyPress;
+use crate::keys::KeyEvent;
 use crate::layout::{Layout, Position};
 use crate::line_buffer::LineBuffer;
-use crate::Result;
+use crate::{Cmd, Result};
 
+pub type KeyMap = ();
 pub type Mode = ();
 
 impl RawMode for Mode {
@@ -20,8 +21,12 @@ impl RawMode for Mode {
     }
 }
 
-impl<'a> RawReader for Iter<'a, KeyPress> {
-    fn next_key(&mut self, _: bool) -> Result<KeyPress> {
+impl<'a> RawReader for Iter<'a, KeyEvent> {
+    fn wait_for_input(&mut self, single_esc_abort: bool) -> Result<Event> {
+        self.next_key(single_esc_abort).map(Event::KeyPress)
+    }
+
+    fn next_key(&mut self, _: bool) -> Result<KeyEvent> {
         match self.next() {
             Some(key) => Ok(*key),
             None => Err(ReadlineError::Eof),
@@ -36,10 +41,18 @@ impl<'a> RawReader for Iter<'a, KeyPress> {
     fn read_pasted_text(&mut self) -> Result<String> {
         unimplemented!()
     }
+
+    fn find_binding(&self, _: &KeyEvent) -> Option<Cmd> {
+        None
+    }
 }
 
-impl RawReader for IntoIter<KeyPress> {
-    fn next_key(&mut self, _: bool) -> Result<KeyPress> {
+impl RawReader for IntoIter<KeyEvent> {
+    fn wait_for_input(&mut self, single_esc_abort: bool) -> Result<Event> {
+        self.next_key(single_esc_abort).map(Event::KeyPress)
+    }
+
+    fn next_key(&mut self, _: bool) -> Result<KeyEvent> {
         match self.next() {
             Some(key) => Ok(key),
             None => Err(ReadlineError::Eof),
@@ -48,8 +61,9 @@ impl RawReader for IntoIter<KeyPress> {
 
     #[cfg(unix)]
     fn next_char(&mut self) -> Result<char> {
+        use crate::keys::{KeyCode as K, KeyEvent as E, Modifiers as M};
         match self.next() {
-            Some(KeyPress::Char(c)) => Ok(c),
+            Some(E(K::Char(c), M::NONE)) => Ok(c),
             None => Err(ReadlineError::Eof),
             _ => unimplemented!(),
         }
@@ -58,18 +72,17 @@ impl RawReader for IntoIter<KeyPress> {
     fn read_pasted_text(&mut self) -> Result<String> {
         unimplemented!()
     }
-}
 
-pub struct Sink {}
-
-impl Sink {
-    pub fn new() -> Sink {
-        Sink {}
+    fn find_binding(&self, _: &KeyEvent) -> Option<Cmd> {
+        None
     }
 }
 
+#[derive(Default)]
+pub struct Sink {}
+
 impl Renderer for Sink {
-    type Reader = IntoIter<KeyPress>;
+    type Reader = IntoIter<KeyEvent>;
 
     fn move_cursor(&mut self, _: Position, _: Position) -> Result<()> {
         Ok(())
@@ -93,7 +106,7 @@ impl Renderer for Sink {
         pos
     }
 
-    fn write_and_flush(&self, _: &[u8]) -> Result<()> {
+    fn write_and_flush(&mut self, _: &str) -> Result<()> {
         Ok(())
     }
 
@@ -105,8 +118,8 @@ impl Renderer for Sink {
         Ok(())
     }
 
-    fn sigwinch(&self) -> bool {
-        false
+    fn clear_rows(&mut self, _: &Layout) -> Result<()> {
+        Ok(())
     }
 
     fn update_size(&mut self) {}
@@ -123,7 +136,15 @@ impl Renderer for Sink {
         false
     }
 
-    fn move_cursor_at_leftmost(&mut self, _: &mut IntoIter<KeyPress>) -> Result<()> {
+    fn move_cursor_at_leftmost(&mut self, _: &mut IntoIter<KeyEvent>) -> Result<()> {
+        Ok(())
+    }
+}
+
+pub struct DummyExternalPrinter {}
+
+impl ExternalPrinter for DummyExternalPrinter {
+    fn print(&mut self, _msg: String) -> Result<()> {
         Ok(())
     }
 }
@@ -132,38 +153,47 @@ pub type Terminal = DummyTerminal;
 
 #[derive(Clone, Debug)]
 pub struct DummyTerminal {
-    pub keys: Vec<KeyPress>,
+    pub keys: Vec<KeyEvent>,
     pub cursor: usize, // cursor position before last command
     pub color_mode: ColorMode,
     pub bell_style: BellStyle,
 }
 
 impl Term for DummyTerminal {
+    type ExternalPrinter = DummyExternalPrinter;
+    type KeyMap = KeyMap;
     type Mode = Mode;
-    type Reader = IntoIter<KeyPress>;
+    type Reader = IntoIter<KeyEvent>;
     type Writer = Sink;
 
     fn new(
         color_mode: ColorMode,
-        _stream: OutputStreamType,
+        _behavior: Behavior,
         _tab_stop: usize,
         bell_style: BellStyle,
-    ) -> DummyTerminal {
-        DummyTerminal {
+        _enable_bracketed_paste: bool,
+    ) -> Result<DummyTerminal> {
+        Ok(DummyTerminal {
             keys: Vec::new(),
             cursor: 0,
             color_mode,
             bell_style,
-        }
+        })
     }
 
     // Init checks:
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn is_unsupported(&self) -> bool {
         false
     }
 
-    fn is_stdin_tty(&self) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    fn is_unsupported(&self) -> bool {
+        true
+    }
+
+    fn is_input_tty(&self) -> bool {
         true
     }
 
@@ -173,16 +203,24 @@ impl Term for DummyTerminal {
 
     // Interactive loop:
 
-    fn enable_raw_mode(&mut self) -> Result<Mode> {
-        Ok(())
+    fn enable_raw_mode(&mut self) -> Result<(Mode, KeyMap)> {
+        Ok(((), ()))
     }
 
-    fn create_reader(&self, _: &Config) -> Result<IntoIter<KeyPress>> {
-        Ok(self.keys.clone().into_iter())
+    fn create_reader(&self, _: &Config, _: KeyMap) -> Self::Reader {
+        self.keys.clone().into_iter()
     }
 
     fn create_writer(&self) -> Sink {
-        Sink::new()
+        Sink::default()
+    }
+
+    fn create_external_printer(&mut self) -> Result<DummyExternalPrinter> {
+        Ok(DummyExternalPrinter {})
+    }
+
+    fn writeln(&self) -> Result<()> {
+        Ok(())
     }
 }
 

@@ -1,7 +1,7 @@
 //! Contains error type for handling I/O and Errno errors
 #[cfg(windows)]
 use std::char;
-use std::error;
+use std::error::Error;
 use std::fmt;
 use std::io;
 
@@ -14,23 +14,24 @@ use std::io;
 pub enum ReadlineError {
     /// I/O Error
     Io(io::Error),
-    /// EOF (Ctrl-D)
+    /// EOF (VEOF / Ctrl-D)
     Eof,
-    /// Ctrl-C
+    /// Interrupt signal (VINTR / VQUIT / Ctrl-C)
     Interrupted,
-    /// Chars Error
-    #[cfg(unix)]
-    Utf8Error,
     /// Unix Error from syscall
     #[cfg(unix)]
     Errno(nix::Error),
-    /// Error generated on WINDOW_BUFFER_SIZE_EVENT to mimic unix SIGWINCH
-    /// signal
-    #[cfg(windows)]
-    WindowResize,
+    /// Error generated on WINDOW_BUFFER_SIZE_EVENT / SIGWINCH signal
+    WindowResized,
     /// Like Utf8Error on unix
     #[cfg(windows)]
     Decode(char::DecodeUtf16Error),
+    /// Something went wrong calling a Windows API
+    #[cfg(windows)]
+    SystemError(clipboard_win::SystemError),
+    /// Error related to SQLite history backend
+    #[cfg(feature = "with-sqlite-history")]
+    SQLiteError(rusqlite::Error),
 }
 
 impl fmt::Display for ReadlineError {
@@ -40,21 +41,59 @@ impl fmt::Display for ReadlineError {
             ReadlineError::Eof => write!(f, "EOF"),
             ReadlineError::Interrupted => write!(f, "Interrupted"),
             #[cfg(unix)]
-            ReadlineError::Utf8Error => write!(f, "invalid utf-8: corrupt contents"),
-            #[cfg(unix)]
             ReadlineError::Errno(ref err) => err.fmt(f),
-            #[cfg(windows)]
-            ReadlineError::WindowResize => write!(f, "WindowResize"),
+            ReadlineError::WindowResized => write!(f, "WindowResized"),
             #[cfg(windows)]
             ReadlineError::Decode(ref err) => err.fmt(f),
+            #[cfg(windows)]
+            ReadlineError::SystemError(ref err) => err.fmt(f),
+            #[cfg(feature = "with-sqlite-history")]
+            ReadlineError::SQLiteError(ref err) => err.fmt(f),
         }
     }
 }
 
-impl error::Error for ReadlineError {}
+impl Error for ReadlineError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match *self {
+            ReadlineError::Io(ref err) => Some(err),
+            ReadlineError::Eof => None,
+            ReadlineError::Interrupted => None,
+            #[cfg(unix)]
+            ReadlineError::Errno(ref err) => Some(err),
+            ReadlineError::WindowResized => None,
+            #[cfg(windows)]
+            ReadlineError::Decode(ref err) => Some(err),
+            #[cfg(windows)]
+            ReadlineError::SystemError(_) => None,
+            #[cfg(feature = "with-sqlite-history")]
+            ReadlineError::SQLiteError(ref err) => Some(err),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct WindowResizedError;
+#[cfg(unix)]
+impl fmt::Display for WindowResizedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WindowResized")
+    }
+}
+#[cfg(unix)]
+impl Error for WindowResizedError {}
 
 impl From<io::Error> for ReadlineError {
     fn from(err: io::Error) -> Self {
+        #[cfg(unix)]
+        if err.kind() == io::ErrorKind::Interrupted {
+            if let Some(e) = err.get_ref() {
+                if e.downcast_ref::<WindowResizedError>().is_some() {
+                    return ReadlineError::WindowResized;
+                }
+            }
+        }
         ReadlineError::Io(err)
     }
 }
@@ -75,6 +114,34 @@ impl From<nix::Error> for ReadlineError {
 #[cfg(windows)]
 impl From<char::DecodeUtf16Error> for ReadlineError {
     fn from(err: char::DecodeUtf16Error) -> Self {
-        ReadlineError::Decode(err)
+        ReadlineError::Io(io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+}
+
+#[cfg(windows)]
+impl From<std::string::FromUtf8Error> for ReadlineError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        ReadlineError::Io(io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+}
+
+#[cfg(unix)]
+impl From<fmt::Error> for ReadlineError {
+    fn from(err: fmt::Error) -> Self {
+        ReadlineError::Io(io::Error::new(io::ErrorKind::Other, err))
+    }
+}
+
+#[cfg(windows)]
+impl From<clipboard_win::SystemError> for ReadlineError {
+    fn from(err: clipboard_win::SystemError) -> Self {
+        ReadlineError::SystemError(err)
+    }
+}
+
+#[cfg(feature = "with-sqlite-history")]
+impl From<rusqlite::Error> for ReadlineError {
+    fn from(err: rusqlite::Error) -> Self {
+        ReadlineError::SQLiteError(err)
     }
 }

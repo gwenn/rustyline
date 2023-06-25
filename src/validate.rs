@@ -15,6 +15,19 @@ pub enum ValidationResult {
     Valid(Option<String>),
 }
 
+impl ValidationResult {
+    pub(crate) fn is_valid(&self) -> bool {
+        matches!(self, ValidationResult::Valid(_))
+    }
+
+    pub(crate) fn has_message(&self) -> bool {
+        matches!(
+            self,
+            ValidationResult::Valid(Some(_)) | ValidationResult::Invalid(Some(_))
+        )
+    }
+}
+
 /// Give access to user input.
 pub struct ValidationContext<'i> {
     i: &'i mut dyn Invoke,
@@ -26,6 +39,7 @@ impl<'i> ValidationContext<'i> {
     }
 
     /// Returns user input.
+    #[must_use]
     pub fn input(&self) -> &str {
         self.i.input()
     }
@@ -64,7 +78,9 @@ pub trait Validator {
     /// when user presses the Enter key.
     ///
     /// Default is `false`.
-    // TODO we can implement this later.
+    ///
+    /// This feature is not yet implemented, so this function is currently a
+    /// no-op
     fn validate_while_typing(&self) -> bool {
         false
     }
@@ -90,6 +106,7 @@ pub struct MatchingBracketValidator {
 
 impl MatchingBracketValidator {
     /// Constructor
+    #[must_use]
     pub fn new() -> Self {
         Self { _priv: () }
     }
@@ -110,14 +127,12 @@ fn validate_brackets(input: &str) -> ValidationResult {
                 (Some('('), ')') | (Some('['), ']') | (Some('{'), '}') => {}
                 (Some(wanted), _) => {
                     return ValidationResult::Invalid(Some(format!(
-                        "Mismatched brackets: {:?} is not properly closed",
-                        wanted
+                        "Mismatched brackets: {wanted:?} is not properly closed"
                     )))
                 }
                 (None, c) => {
                     return ValidationResult::Invalid(Some(format!(
-                        "Mismatched brackets: {:?} is unpaired",
-                        c
+                        "Mismatched brackets: {c:?} is unpaired"
                     )))
                 }
             },

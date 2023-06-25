@@ -1,48 +1,41 @@
 //! Unix specific definitions
-use std::cmp::Ordering;
-use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync;
-use std::sync::atomic;
+use std::cmp;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, ErrorKind, Read, Write};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
 
 use log::{debug, warn};
+use nix::errno::Errno;
 use nix::poll::{self, PollFlags};
-use nix::sys::signal;
-use nix::sys::termios;
-use nix::sys::termios::SetArg;
+use nix::sys::select::{self, FdSet};
+use nix::sys::termios::{self, SetArg, SpecialCharacterIndices as SCI, Termios};
+use nix::unistd::{close, isatty, read, write};
 use unicode_segmentation::UnicodeSegmentation;
 use utf8parse::{Parser, Receiver};
 
-use super::{width, RawMode, RawReader, Renderer, Term};
-use crate::config::{BellStyle, ColorMode, Config, OutputStreamType};
-use crate::error;
+use super::{width, Event, RawMode, RawReader, Renderer, Term};
+use crate::config::{Behavior, BellStyle, ColorMode, Config};
 use crate::highlight::Highlighter;
-use crate::keys::{self, KeyPress};
+use crate::keys::{KeyCode as K, KeyEvent, KeyEvent as E, Modifiers as M};
 use crate::layout::{Layout, Position};
 use crate::line_buffer::LineBuffer;
-use crate::Result;
-
-const STDIN_FILENO: RawFd = libc::STDIN_FILENO;
+use crate::{error, Cmd, ReadlineError, Result};
 
 /// Unsupported Terminals that don't support RAW mode
 const UNSUPPORTED_TERM: [&str; 3] = ["dumb", "cons25", "emacs"];
 
-const BRACKETED_PASTE_ON: &[u8] = b"\x1b[?2004h";
-const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
-
-impl AsRawFd for OutputStreamType {
-    fn as_raw_fd(&self) -> RawFd {
-        match self {
-            OutputStreamType::Stdout => libc::STDOUT_FILENO,
-            OutputStreamType::Stderr => libc::STDERR_FILENO,
-        }
-    }
-}
+const BRACKETED_PASTE_ON: &str = "\x1b[?2004h";
+const BRACKETED_PASTE_OFF: &str = "\x1b[?2004l";
 
 nix::ioctl_read_bad!(win_size, libc::TIOCGWINSZ, libc::winsize);
 
-#[allow(clippy::identity_conversion)]
-fn get_win_size<T: AsRawFd + ?Sized>(fileno: &T) -> (usize, usize) {
+#[allow(clippy::useless_conversion)]
+fn get_win_size(fd: RawFd) -> (usize, usize) {
     use std::mem::zeroed;
 
     if cfg!(test) {
@@ -51,8 +44,24 @@ fn get_win_size<T: AsRawFd + ?Sized>(fileno: &T) -> (usize, usize) {
 
     unsafe {
         let mut size: libc::winsize = zeroed();
-        match win_size(fileno.as_raw_fd(), &mut size) {
-            Ok(0) => (size.ws_col as usize, size.ws_row as usize), // TODO getCursorPosition
+        match win_size(fd, &mut size) {
+            Ok(0) => {
+                // In linux pseudo-terminals are created with dimensions of
+                // zero. If host application didn't initialize the correct
+                // size before start we treat zero size as 80 columns and
+                // infinite rows
+                let cols = if size.ws_col == 0 {
+                    80
+                } else {
+                    size.ws_col as usize
+                };
+                let rows = if size.ws_row == 0 {
+                    usize::MAX
+                } else {
+                    size.ws_row as usize
+                };
+                (cols, rows)
+            }
             _ => (80, 24),
         }
     }
@@ -76,12 +85,19 @@ fn is_unsupported_term() -> bool {
 
 /// Return whether or not STDIN, STDOUT or STDERR is a TTY
 fn is_a_tty(fd: RawFd) -> bool {
-    unsafe { libc::isatty(fd) != 0 }
+    isatty(fd).unwrap_or(false)
 }
 
+pub type PosixKeyMap = HashMap<KeyEvent, Cmd>;
+#[cfg(not(test))]
+pub type KeyMap = PosixKeyMap;
+
+#[must_use = "You must restore default mode (disable_raw_mode)"]
 pub struct PosixMode {
-    termios: termios::Termios,
-    out: Option<OutputStreamType>,
+    termios: Termios,
+    tty_in: RawFd,
+    tty_out: Option<RawFd>,
+    raw_mode: Arc<AtomicBool>,
 }
 
 #[cfg(not(test))]
@@ -90,34 +106,41 @@ pub type Mode = PosixMode;
 impl RawMode for PosixMode {
     /// Disable RAW mode for the terminal.
     fn disable_raw_mode(&self) -> Result<()> {
-        termios::tcsetattr(STDIN_FILENO, SetArg::TCSADRAIN, &self.termios)?;
+        termios::tcsetattr(self.tty_in, SetArg::TCSADRAIN, &self.termios)?;
         // disable bracketed paste
-        if let Some(out) = self.out {
-            write_and_flush(out, BRACKETED_PASTE_OFF)?;
+        if let Some(out) = self.tty_out {
+            write_all(out, BRACKETED_PASTE_OFF)?;
         }
+        self.raw_mode.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
 
 // Rust std::io::Stdin is buffered with no way to know if bytes are available.
 // So we use low-level stuff instead...
-struct StdinRaw {}
+struct TtyIn {
+    fd: RawFd,
+    sigwinch_pipe: Option<RawFd>,
+}
 
-impl Read for StdinRaw {
+impl Read for TtyIn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let res = unsafe {
                 libc::read(
-                    STDIN_FILENO,
+                    self.fd,
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len() as libc::size_t,
                 )
             };
             if res == -1 {
                 let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted
-                    || SIGWINCH.load(atomic::Ordering::Relaxed)
-                {
+                if error.kind() == ErrorKind::Interrupted && self.sigwinch()? {
+                    return Err(io::Error::new(
+                        ErrorKind::Interrupted,
+                        error::WindowResizedError,
+                    ));
+                } else if error.kind() != ErrorKind::Interrupted {
                     return Err(error);
                 }
             } else {
@@ -128,13 +151,43 @@ impl Read for StdinRaw {
     }
 }
 
+impl TtyIn {
+    /// Check if a SIGWINCH signal has been received
+    fn sigwinch(&self) -> nix::Result<bool> {
+        if let Some(pipe) = self.sigwinch_pipe {
+            let mut buf = [0u8; 64];
+            match read(pipe, &mut buf) {
+                Ok(0) => Ok(false),
+                Ok(_) => Ok(true),
+                Err(e) if e == Errno::EWOULDBLOCK || e == Errno::EINTR => Ok(false),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+// (native receiver with a selectable file descriptor, actual message receiver)
+type PipeReader = Arc<Mutex<(File, mpsc::Receiver<String>)>>;
+// (native sender, actual message sender)
+type PipeWriter = (Arc<Mutex<File>>, SyncSender<String>);
+
 /// Console input reader
 pub struct PosixRawReader {
-    stdin: StdinRaw,
+    tty_in: BufReader<TtyIn>,
     timeout_ms: i32,
-    buf: [u8; 1],
     parser: Parser,
-    receiver: Utf8,
+    key_map: PosixKeyMap,
+    // external print reader
+    pipe_reader: Option<PipeReader>,
+    fds: FdSet,
+}
+
+impl AsRawFd for PosixRawReader {
+    fn as_raw_fd(&self) -> RawFd {
+        self.tty_in.get_ref().fd
+    }
 }
 
 struct Utf8 {
@@ -142,48 +195,115 @@ struct Utf8 {
     valid: bool,
 }
 
-impl PosixRawReader {
-    fn new(config: &Config) -> Result<Self> {
-        Ok(Self {
-            stdin: StdinRaw {},
-            timeout_ms: config.keyseq_timeout(),
-            buf: [0; 1],
-            parser: Parser::new(),
-            receiver: Utf8 {
-                c: None,
-                valid: true,
-            },
-        })
-    }
+const UP: char = 'A'; // kcuu1, kUP*
+const DOWN: char = 'B'; // kcud1, kDN*
+const RIGHT: char = 'C'; // kcuf1, kRIT*
+const LEFT: char = 'D'; // kcub1, kLFT*
+const END: char = 'F'; // kend*
+const HOME: char = 'H'; // khom*
+const INSERT: char = '2'; // kic*
+const DELETE: char = '3'; // kdch1, kDC*
+const PAGE_UP: char = '5'; // kpp, kPRV*
+const PAGE_DOWN: char = '6'; // knp, kNXT*
 
-    /// Handle ESC <seq1> sequences
-    fn escape_sequence(&mut self) -> Result<KeyPress> {
-        // Read the next byte representing the escape sequence.
-        let seq1 = self.next_char()?;
-        if seq1 == '[' {
-            // ESC [ sequences. (CSI)
-            self.escape_csi()
-        } else if seq1 == 'O' {
-            // xterm
-            // ESC O sequences. (SS3)
-            self.escape_o()
-        } else if seq1 == '\x1b' {
-            // ESC ESC
-            Ok(KeyPress::Esc)
-        } else {
-            // TODO ESC-R (r): Undo all changes made to this line.
-            Ok(KeyPress::Meta(seq1))
+const RXVT_HOME: char = '7';
+const RXVT_END: char = '8';
+
+const SHIFT: char = '2';
+const ALT: char = '3';
+const ALT_SHIFT: char = '4';
+const CTRL: char = '5';
+const CTRL_SHIFT: char = '6';
+const CTRL_ALT: char = '7';
+const CTRL_ALT_SHIFT: char = '8';
+
+const RXVT_SHIFT: char = '$';
+const RXVT_CTRL: char = '\x1e';
+const RXVT_CTRL_SHIFT: char = '@';
+
+impl PosixRawReader {
+    fn new(
+        fd: RawFd,
+        sigwinch_pipe: Option<RawFd>,
+        config: &Config,
+        key_map: PosixKeyMap,
+        pipe_reader: Option<PipeReader>,
+    ) -> Self {
+        Self {
+            tty_in: BufReader::with_capacity(1024, TtyIn { fd, sigwinch_pipe }),
+            timeout_ms: config.keyseq_timeout(),
+            parser: Parser::new(),
+            key_map,
+            pipe_reader,
+            fds: FdSet::new(),
         }
     }
 
-    /// Handle ESC [ <seq2> escape sequences
-    fn escape_csi(&mut self) -> Result<KeyPress> {
+    /// Handle \E <seq1> sequences
+    // https://invisible-island.net/xterm/xterm-function-keys.html
+    fn escape_sequence(&mut self) -> Result<KeyEvent> {
+        self._do_escape_sequence(true)
+    }
+
+    /// Don't call directly, call `PosixRawReader::escape_sequence` instead
+    fn _do_escape_sequence(&mut self, allow_recurse: bool) -> Result<KeyEvent> {
+        // Read the next byte representing the escape sequence.
+        let seq1 = self.next_char()?;
+        if seq1 == '[' {
+            // \E[ sequences. (CSI)
+            self.escape_csi()
+        } else if seq1 == 'O' {
+            // xterm
+            // \EO sequences. (SS3)
+            self.escape_o()
+        } else if seq1 == '\x1b' {
+            // \E\E — used by rxvt, iTerm (under default config), etc.
+            // ```
+            // \E\E[A => Alt-Up
+            // \E\E[B => Alt-Down
+            // \E\E[C => Alt-Right
+            // \E\E[D => Alt-Left
+            // ```
+            //
+            // In general this more or less works just adding ALT to an existing
+            // key, but has a wrinkle in that `ESC ESC` without anything
+            // following should be interpreted as the the escape key.
+            //
+            // We handle this by polling to see if there's anything coming
+            // within our timeout, and if so, recursing once, but adding alt to
+            // what we read.
+            if !allow_recurse {
+                return Ok(E::ESC);
+            }
+            let timeout = if self.timeout_ms < 0 {
+                100
+            } else {
+                self.timeout_ms
+            };
+            match self.poll(timeout) {
+                // Ignore poll errors, it's very likely we'll pick them up on
+                // the next read anyway.
+                Ok(0) | Err(_) => Ok(E::ESC),
+                Ok(n) => {
+                    debug_assert!(n > 0, "{}", n);
+                    // recurse, and add the alt modifier.
+                    let E(k, m) = self._do_escape_sequence(false)?;
+                    Ok(E(k, m | M::ALT))
+                }
+            }
+        } else {
+            Ok(E::alt(seq1))
+        }
+    }
+
+    /// Handle \E[ <seq2> escape sequences
+    fn escape_csi(&mut self) -> Result<KeyEvent> {
         let seq2 = self.next_char()?;
-        if seq2.is_digit(10) {
+        if seq2.is_ascii_digit() {
             match seq2 {
                 '0' | '9' => {
-                    debug!(target: "rustyline", "unsupported esc sequence: ESC [ {:?}", seq2);
-                    Ok(KeyPress::UnknownEscSeq)
+                    debug!(target: "rustyline", "unsupported esc sequence: \\E[{:?}", seq2);
+                    Ok(E(K::UnknownEscSeq, M::NONE))
                 }
                 _ => {
                     // Extended escape, read additional byte.
@@ -194,197 +314,463 @@ impl PosixRawReader {
             let seq3 = self.next_char()?;
             // Linux console
             Ok(match seq3 {
-                'A' => KeyPress::F(1),
-                'B' => KeyPress::F(2),
-                'C' => KeyPress::F(3),
-                'D' => KeyPress::F(4),
-                'E' => KeyPress::F(5),
+                'A' => E(K::F(1), M::NONE),
+                'B' => E(K::F(2), M::NONE),
+                'C' => E(K::F(3), M::NONE),
+                'D' => E(K::F(4), M::NONE),
+                'E' => E(K::F(5), M::NONE),
                 _ => {
-                    debug!(target: "rustyline", "unsupported esc sequence: ESC [ [ {:?}", seq3);
-                    KeyPress::UnknownEscSeq
+                    debug!(target: "rustyline", "unsupported esc sequence: \\E[[{:?}", seq3);
+                    E(K::UnknownEscSeq, M::NONE)
                 }
             })
         } else {
             // ANSI
             Ok(match seq2 {
-                'A' => KeyPress::Up,    // kcuu1
-                'B' => KeyPress::Down,  // kcud1
-                'C' => KeyPress::Right, // kcuf1
-                'D' => KeyPress::Left,  // kcub1
-                'F' => KeyPress::End,
-                'H' => KeyPress::Home, // khome
-                'Z' => KeyPress::BackTab,
+                UP => E(K::Up, M::NONE),
+                DOWN => E(K::Down, M::NONE),
+                RIGHT => E(K::Right, M::NONE),
+                LEFT => E(K::Left, M::NONE),
+                //'E' => E(K::, M::), // Ignore
+                END => E(K::End, M::NONE),
+                //'G' => E(K::, M::), // Ignore
+                HOME => E(K::Home, M::NONE), // khome
+                //'J' => E(K::, M::), // clr_eos
+                //'K' => E(K::, M::), // clr_eol
+                //'L' => E(K::, M::), // il1
+                //'M' => E(K::, M::), // kmous
+                //'P' => E(K::Delete, M::NONE), // dch1
+                'Z' => E(K::BackTab, M::NONE),
+                'a' => E(K::Up, M::SHIFT),    // rxvt: kind or kUP
+                'b' => E(K::Down, M::SHIFT),  // rxvt: kri or kDN
+                'c' => E(K::Right, M::SHIFT), // rxvt
+                'd' => E(K::Left, M::SHIFT),  // rxvt
                 _ => {
-                    debug!(target: "rustyline", "unsupported esc sequence: ESC [ {:?}", seq2);
-                    KeyPress::UnknownEscSeq
+                    debug!(target: "rustyline", "unsupported esc sequence: \\E[{:?}", seq2);
+                    E(K::UnknownEscSeq, M::NONE)
                 }
             })
         }
     }
 
-    /// Handle ESC [ <seq2:digit> escape sequences
+    /// Handle \E[ <seq2:digit> escape sequences
     #[allow(clippy::cognitive_complexity)]
-    fn extended_escape(&mut self, seq2: char) -> Result<KeyPress> {
+    fn extended_escape(&mut self, seq2: char) -> Result<KeyEvent> {
         let seq3 = self.next_char()?;
         if seq3 == '~' {
             Ok(match seq2 {
-                '1' | '7' => KeyPress::Home, // tmux, xrvt
-                '2' => KeyPress::Insert,
-                '3' => KeyPress::Delete,    // kdch1
-                '4' | '8' => KeyPress::End, // tmux, xrvt
-                '5' => KeyPress::PageUp,    // kpp
-                '6' => KeyPress::PageDown,  // knp
+                '1' | RXVT_HOME => E(K::Home, M::NONE), // tmux, xrvt
+                INSERT => E(K::Insert, M::NONE),
+                DELETE => E(K::Delete, M::NONE),
+                '4' | RXVT_END => E(K::End, M::NONE), // tmux, xrvt
+                PAGE_UP => E(K::PageUp, M::NONE),
+                PAGE_DOWN => E(K::PageDown, M::NONE),
                 _ => {
                     debug!(target: "rustyline",
-                           "unsupported esc sequence: ESC [ {} ~", seq2);
-                    KeyPress::UnknownEscSeq
+                           "unsupported esc sequence: \\E[{}~", seq2);
+                    E(K::UnknownEscSeq, M::NONE)
                 }
             })
-        } else if seq3.is_digit(10) {
+        } else if seq3.is_ascii_digit() {
             let seq4 = self.next_char()?;
             if seq4 == '~' {
                 Ok(match (seq2, seq3) {
-                    ('1', '1') => KeyPress::F(1),  // rxvt-unicode
-                    ('1', '2') => KeyPress::F(2),  // rxvt-unicode
-                    ('1', '3') => KeyPress::F(3),  // rxvt-unicode
-                    ('1', '4') => KeyPress::F(4),  // rxvt-unicode
-                    ('1', '5') => KeyPress::F(5),  // kf5
-                    ('1', '7') => KeyPress::F(6),  // kf6
-                    ('1', '8') => KeyPress::F(7),  // kf7
-                    ('1', '9') => KeyPress::F(8),  // kf8
-                    ('2', '0') => KeyPress::F(9),  // kf9
-                    ('2', '1') => KeyPress::F(10), // kf10
-                    ('2', '3') => KeyPress::F(11), // kf11
-                    ('2', '4') => KeyPress::F(12), // kf12
+                    ('1', '1') => E(K::F(1), M::NONE),  // rxvt-unicode
+                    ('1', '2') => E(K::F(2), M::NONE),  // rxvt-unicode
+                    ('1', '3') => E(K::F(3), M::NONE),  // rxvt-unicode
+                    ('1', '4') => E(K::F(4), M::NONE),  // rxvt-unicode
+                    ('1', '5') => E(K::F(5), M::NONE),  // kf5
+                    ('1', '7') => E(K::F(6), M::NONE),  // kf6
+                    ('1', '8') => E(K::F(7), M::NONE),  // kf7
+                    ('1', '9') => E(K::F(8), M::NONE),  // kf8
+                    ('2', '0') => E(K::F(9), M::NONE),  // kf9
+                    ('2', '1') => E(K::F(10), M::NONE), // kf10
+                    ('2', '3') => E(K::F(11), M::NONE), // kf11
+                    ('2', '4') => E(K::F(12), M::NONE), // kf12
+                    //('6', '2') => KeyCode::ScrollUp,
+                    //('6', '3') => KeyCode::ScrollDown,
                     _ => {
                         debug!(target: "rustyline",
-                               "unsupported esc sequence: ESC [ {}{} ~", seq2, seq3);
-                        KeyPress::UnknownEscSeq
+                               "unsupported esc sequence: \\E[{}{}~", seq2, seq3);
+                        E(K::UnknownEscSeq, M::NONE)
                     }
                 })
             } else if seq4 == ';' {
                 let seq5 = self.next_char()?;
-                if seq5.is_digit(10) {
+                if seq5.is_ascii_digit() {
                     let seq6 = self.next_char()?;
-                    if seq6.is_digit(10) {
+                    if seq6.is_ascii_digit() {
                         self.next_char()?; // 'R' expected
+                        Ok(E(K::UnknownEscSeq, M::NONE))
                     } else if seq6 == 'R' {
+                        Ok(E(K::UnknownEscSeq, M::NONE))
+                    } else if seq6 == '~' {
+                        Ok(match (seq2, seq3, seq5) {
+                            ('1', '5', CTRL) => E(K::F(5), M::CTRL),
+                            //('1', '5', '6') => E(K::F(17), M::CTRL),
+                            ('1', '7', CTRL) => E(K::F(6), M::CTRL),
+                            //('1', '7', '6') => E(K::F(18), M::CTRL),
+                            ('1', '8', CTRL) => E(K::F(7), M::CTRL),
+                            ('1', '9', CTRL) => E(K::F(8), M::CTRL),
+                            //('1', '9', '6') => E(K::F(19), M::CTRL),
+                            ('2', '0', CTRL) => E(K::F(9), M::CTRL),
+                            //('2', '0', '6') => E(K::F(21), M::CTRL),
+                            ('2', '1', CTRL) => E(K::F(10), M::CTRL),
+                            //('2', '1', '6') => E(K::F(22), M::CTRL),
+                            ('2', '3', CTRL) => E(K::F(11), M::CTRL),
+                            //('2', '3', '6') => E(K::F(23), M::CTRL),
+                            ('2', '4', CTRL) => E(K::F(12), M::CTRL),
+                            //('2', '4', '6') => E(K::F(24), M::CTRL),
+                            _ => {
+                                debug!(target: "rustyline",
+                                       "unsupported esc sequence: \\E[{}{};{}~", seq2, seq3, seq5);
+                                E(K::UnknownEscSeq, M::NONE)
+                            }
+                        })
                     } else {
                         debug!(target: "rustyline",
-                               "unsupported esc sequence: ESC [ {}{} ; {} {}", seq2, seq3, seq5, seq6);
+                               "unsupported esc sequence: \\E[{}{};{}{}", seq2, seq3, seq5, seq6);
+                        Ok(E(K::UnknownEscSeq, M::NONE))
                     }
                 } else {
                     debug!(target: "rustyline",
-                           "unsupported esc sequence: ESC [ {}{} ; {:?}", seq2, seq3, seq5);
+                           "unsupported esc sequence: \\E[{}{};{:?}", seq2, seq3, seq5);
+                    Ok(E(K::UnknownEscSeq, M::NONE))
                 }
-                Ok(KeyPress::UnknownEscSeq)
-            } else if seq4.is_digit(10) {
+            } else if seq4.is_ascii_digit() {
                 let seq5 = self.next_char()?;
                 if seq5 == '~' {
                     Ok(match (seq2, seq3, seq4) {
-                        ('2', '0', '0') => KeyPress::BracketedPasteStart,
-                        ('2', '0', '1') => KeyPress::BracketedPasteEnd,
+                        ('2', '0', '0') => E(K::BracketedPasteStart, M::NONE),
+                        ('2', '0', '1') => E(K::BracketedPasteEnd, M::NONE),
                         _ => {
                             debug!(target: "rustyline",
-                                   "unsupported esc sequence: ESC [ {}{}{}~", seq2, seq3, seq4);
-                            KeyPress::UnknownEscSeq
+                                   "unsupported esc sequence: \\E[{}{}{}~", seq2, seq3, seq4);
+                            E(K::UnknownEscSeq, M::NONE)
                         }
                     })
                 } else {
                     debug!(target: "rustyline",
-                           "unsupported esc sequence: ESC [ {}{}{} {}", seq2, seq3, seq4, seq5);
-                    Ok(KeyPress::UnknownEscSeq)
+                           "unsupported esc sequence: \\E[{}{}{}{}", seq2, seq3, seq4, seq5);
+                    Ok(E(K::UnknownEscSeq, M::NONE))
                 }
             } else {
                 debug!(target: "rustyline",
-                       "unsupported esc sequence: ESC [ {}{} {:?}", seq2, seq3, seq4);
-                Ok(KeyPress::UnknownEscSeq)
+                       "unsupported esc sequence: \\E[{}{}{:?}", seq2, seq3, seq4);
+                Ok(E(K::UnknownEscSeq, M::NONE))
             }
         } else if seq3 == ';' {
             let seq4 = self.next_char()?;
-            if seq4.is_digit(10) {
+            if seq4.is_ascii_digit() {
                 let seq5 = self.next_char()?;
-                if seq5.is_digit(10) {
+                if seq5.is_ascii_digit() {
                     self.next_char()?; // 'R' expected
-                    Ok(KeyPress::UnknownEscSeq)
+                                       //('1', '0', UP) => E(K::, M::), // Alt + Shift + Up
+                    Ok(E(K::UnknownEscSeq, M::NONE))
                 } else if seq2 == '1' {
                     Ok(match (seq4, seq5) {
-                        ('5', 'A') => KeyPress::ControlUp,
-                        ('5', 'B') => KeyPress::ControlDown,
-                        ('5', 'C') => KeyPress::ControlRight,
-                        ('5', 'D') => KeyPress::ControlLeft,
-                        ('2', 'A') => KeyPress::ShiftUp,
-                        ('2', 'B') => KeyPress::ShiftDown,
-                        ('2', 'C') => KeyPress::ShiftRight,
-                        ('2', 'D') => KeyPress::ShiftLeft,
+                        (SHIFT, UP) => E(K::Up, M::SHIFT),     // ~ key_sr
+                        (SHIFT, DOWN) => E(K::Down, M::SHIFT), // ~ key_sf
+                        (SHIFT, RIGHT) => E(K::Right, M::SHIFT),
+                        (SHIFT, LEFT) => E(K::Left, M::SHIFT),
+                        (SHIFT, END) => E(K::End, M::SHIFT), // kEND
+                        (SHIFT, HOME) => E(K::Home, M::SHIFT), // kHOM
+                        //('2', 'P') => E(K::F(13), M::NONE),
+                        //('2', 'Q') => E(K::F(14), M::NONE),
+                        //('2', 'S') => E(K::F(16), M::NONE),
+                        (ALT, UP) => E(K::Up, M::ALT),
+                        (ALT, DOWN) => E(K::Down, M::ALT),
+                        (ALT, RIGHT) => E(K::Right, M::ALT),
+                        (ALT, LEFT) => E(K::Left, M::ALT),
+                        (ALT, END) => E(K::End, M::ALT),
+                        (ALT, HOME) => E(K::Home, M::ALT),
+                        (ALT_SHIFT, UP) => E(K::Up, M::ALT_SHIFT),
+                        (ALT_SHIFT, DOWN) => E(K::Down, M::ALT_SHIFT),
+                        (ALT_SHIFT, RIGHT) => E(K::Right, M::ALT_SHIFT),
+                        (ALT_SHIFT, LEFT) => E(K::Left, M::ALT_SHIFT),
+                        (ALT_SHIFT, END) => E(K::End, M::ALT_SHIFT),
+                        (ALT_SHIFT, HOME) => E(K::Home, M::ALT_SHIFT),
+                        (CTRL, UP) => E(K::Up, M::CTRL),
+                        (CTRL, DOWN) => E(K::Down, M::CTRL),
+                        (CTRL, RIGHT) => E(K::Right, M::CTRL),
+                        (CTRL, LEFT) => E(K::Left, M::CTRL),
+                        (CTRL, END) => E(K::End, M::CTRL),
+                        (CTRL, HOME) => E(K::Home, M::CTRL),
+                        (CTRL, 'P') => E(K::F(1), M::CTRL),
+                        (CTRL, 'Q') => E(K::F(2), M::CTRL),
+                        (CTRL, 'S') => E(K::F(4), M::CTRL),
+                        (CTRL, 'p') => E(K::Char('0'), M::CTRL),
+                        (CTRL, 'q') => E(K::Char('1'), M::CTRL),
+                        (CTRL, 'r') => E(K::Char('2'), M::CTRL),
+                        (CTRL, 's') => E(K::Char('3'), M::CTRL),
+                        (CTRL, 't') => E(K::Char('4'), M::CTRL),
+                        (CTRL, 'u') => E(K::Char('5'), M::CTRL),
+                        (CTRL, 'v') => E(K::Char('6'), M::CTRL),
+                        (CTRL, 'w') => E(K::Char('7'), M::CTRL),
+                        (CTRL, 'x') => E(K::Char('8'), M::CTRL),
+                        (CTRL, 'y') => E(K::Char('9'), M::CTRL),
+                        (CTRL_SHIFT, UP) => E(K::Up, M::CTRL_SHIFT),
+                        (CTRL_SHIFT, DOWN) => E(K::Down, M::CTRL_SHIFT),
+                        (CTRL_SHIFT, RIGHT) => E(K::Right, M::CTRL_SHIFT),
+                        (CTRL_SHIFT, LEFT) => E(K::Left, M::CTRL_SHIFT),
+                        (CTRL_SHIFT, END) => E(K::End, M::CTRL_SHIFT),
+                        (CTRL_SHIFT, HOME) => E(K::Home, M::CTRL_SHIFT),
+                        //('6', 'P') => E(K::F(13), M::CTRL),
+                        //('6', 'Q') => E(K::F(14), M::CTRL),
+                        //('6', 'S') => E(K::F(16), M::CTRL),
+                        (CTRL_SHIFT, 'p') => E(K::Char('0'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 'q') => E(K::Char('1'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 'r') => E(K::Char('2'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 's') => E(K::Char('3'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 't') => E(K::Char('4'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 'u') => E(K::Char('5'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 'v') => E(K::Char('6'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 'w') => E(K::Char('7'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 'x') => E(K::Char('8'), M::CTRL_SHIFT),
+                        (CTRL_SHIFT, 'y') => E(K::Char('9'), M::CTRL_SHIFT),
+                        (CTRL_ALT, UP) => E(K::Up, M::CTRL_ALT),
+                        (CTRL_ALT, DOWN) => E(K::Down, M::CTRL_ALT),
+                        (CTRL_ALT, RIGHT) => E(K::Right, M::CTRL_ALT),
+                        (CTRL_ALT, LEFT) => E(K::Left, M::CTRL_ALT),
+                        (CTRL_ALT, END) => E(K::End, M::CTRL_ALT),
+                        (CTRL_ALT, HOME) => E(K::Home, M::CTRL_ALT),
+                        (CTRL_ALT, 'p') => E(K::Char('0'), M::CTRL_ALT),
+                        (CTRL_ALT, 'q') => E(K::Char('1'), M::CTRL_ALT),
+                        (CTRL_ALT, 'r') => E(K::Char('2'), M::CTRL_ALT),
+                        (CTRL_ALT, 's') => E(K::Char('3'), M::CTRL_ALT),
+                        (CTRL_ALT, 't') => E(K::Char('4'), M::CTRL_ALT),
+                        (CTRL_ALT, 'u') => E(K::Char('5'), M::CTRL_ALT),
+                        (CTRL_ALT, 'v') => E(K::Char('6'), M::CTRL_ALT),
+                        (CTRL_ALT, 'w') => E(K::Char('7'), M::CTRL_ALT),
+                        (CTRL_ALT, 'x') => E(K::Char('8'), M::CTRL_ALT),
+                        (CTRL_ALT, 'y') => E(K::Char('9'), M::CTRL_ALT),
+                        (CTRL_ALT_SHIFT, UP) => E(K::Up, M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, DOWN) => E(K::Down, M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, RIGHT) => E(K::Right, M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, LEFT) => E(K::Left, M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, END) => E(K::End, M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, HOME) => E(K::Home, M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 'p') => E(K::Char('0'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 'q') => E(K::Char('1'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 'r') => E(K::Char('2'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 's') => E(K::Char('3'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 't') => E(K::Char('4'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 'u') => E(K::Char('5'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 'v') => E(K::Char('6'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 'w') => E(K::Char('7'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 'x') => E(K::Char('8'), M::CTRL_ALT_SHIFT),
+                        (CTRL_ALT_SHIFT, 'y') => E(K::Char('9'), M::CTRL_ALT_SHIFT),
+                        // Meta + arrow on (some?) Macs when using iTerm defaults
+                        ('9', UP) => E(K::Up, M::ALT),
+                        ('9', DOWN) => E(K::Down, M::ALT),
+                        ('9', RIGHT) => E(K::Right, M::ALT),
+                        ('9', LEFT) => E(K::Left, M::ALT),
                         _ => {
                             debug!(target: "rustyline",
-                                   "unsupported esc sequence: ESC [ 1 ; {} {:?}", seq4, seq5);
-                            KeyPress::UnknownEscSeq
+                                   "unsupported esc sequence: \\E[1;{}{:?}", seq4, seq5);
+                            E(K::UnknownEscSeq, M::NONE)
+                        }
+                    })
+                } else if seq5 == '~' {
+                    Ok(match (seq2, seq4) {
+                        (INSERT, SHIFT) => E(K::Insert, M::SHIFT),
+                        (INSERT, ALT) => E(K::Insert, M::ALT),
+                        (INSERT, ALT_SHIFT) => E(K::Insert, M::ALT_SHIFT),
+                        (INSERT, CTRL) => E(K::Insert, M::CTRL),
+                        (INSERT, CTRL_SHIFT) => E(K::Insert, M::CTRL_SHIFT),
+                        (INSERT, CTRL_ALT) => E(K::Insert, M::CTRL_ALT),
+                        (INSERT, CTRL_ALT_SHIFT) => E(K::Insert, M::CTRL_ALT_SHIFT),
+                        (DELETE, SHIFT) => E(K::Delete, M::SHIFT),
+                        (DELETE, ALT) => E(K::Delete, M::ALT),
+                        (DELETE, ALT_SHIFT) => E(K::Delete, M::ALT_SHIFT),
+                        (DELETE, CTRL) => E(K::Delete, M::CTRL),
+                        (DELETE, CTRL_SHIFT) => E(K::Delete, M::CTRL_SHIFT),
+                        (DELETE, CTRL_ALT) => E(K::Delete, M::CTRL_ALT),
+                        (DELETE, CTRL_ALT_SHIFT) => E(K::Delete, M::CTRL_ALT_SHIFT),
+                        (PAGE_UP, SHIFT) => E(K::PageUp, M::SHIFT),
+                        (PAGE_UP, ALT) => E(K::PageUp, M::ALT),
+                        (PAGE_UP, ALT_SHIFT) => E(K::PageUp, M::ALT_SHIFT),
+                        (PAGE_UP, CTRL) => E(K::PageUp, M::CTRL),
+                        (PAGE_UP, CTRL_SHIFT) => E(K::PageUp, M::CTRL_SHIFT),
+                        (PAGE_UP, CTRL_ALT) => E(K::PageUp, M::CTRL_ALT),
+                        (PAGE_UP, CTRL_ALT_SHIFT) => E(K::PageUp, M::CTRL_ALT_SHIFT),
+                        (PAGE_DOWN, SHIFT) => E(K::PageDown, M::SHIFT),
+                        (PAGE_DOWN, ALT) => E(K::PageDown, M::ALT),
+                        (PAGE_DOWN, ALT_SHIFT) => E(K::PageDown, M::ALT_SHIFT),
+                        (PAGE_DOWN, CTRL) => E(K::PageDown, M::CTRL),
+                        (PAGE_DOWN, CTRL_SHIFT) => E(K::PageDown, M::CTRL_SHIFT),
+                        (PAGE_DOWN, CTRL_ALT) => E(K::PageDown, M::CTRL_ALT),
+                        (PAGE_DOWN, CTRL_ALT_SHIFT) => E(K::PageDown, M::CTRL_ALT_SHIFT),
+                        _ => {
+                            debug!(target: "rustyline",
+                                   "unsupported esc sequence: \\E[{};{:?}~", seq2, seq4);
+                            E(K::UnknownEscSeq, M::NONE)
                         }
                     })
                 } else {
                     debug!(target: "rustyline",
-                           "unsupported esc sequence: ESC [ {} ; {} {:?}", seq2, seq4, seq5);
-                    Ok(KeyPress::UnknownEscSeq)
+                           "unsupported esc sequence: \\E[{};{}{:?}", seq2, seq4, seq5);
+                    Ok(E(K::UnknownEscSeq, M::NONE))
                 }
             } else {
                 debug!(target: "rustyline",
-                       "unsupported esc sequence: ESC [ {} ; {:?}", seq2, seq4);
-                Ok(KeyPress::UnknownEscSeq)
+                       "unsupported esc sequence: \\E[{};{:?}", seq2, seq4);
+                Ok(E(K::UnknownEscSeq, M::NONE))
             }
         } else {
             Ok(match (seq2, seq3) {
-                ('5', 'A') => KeyPress::ControlUp,
-                ('5', 'B') => KeyPress::ControlDown,
-                ('5', 'C') => KeyPress::ControlRight,
-                ('5', 'D') => KeyPress::ControlLeft,
+                (DELETE, RXVT_CTRL) => E(K::Delete, M::CTRL),
+                (DELETE, RXVT_CTRL_SHIFT) => E(K::Delete, M::CTRL_SHIFT),
+                (CTRL, UP) => E(K::Up, M::CTRL),
+                (CTRL, DOWN) => E(K::Down, M::CTRL),
+                (CTRL, RIGHT) => E(K::Right, M::CTRL),
+                (CTRL, LEFT) => E(K::Left, M::CTRL),
+                (PAGE_UP, RXVT_CTRL) => E(K::PageUp, M::CTRL),
+                (PAGE_UP, RXVT_SHIFT) => E(K::PageUp, M::SHIFT),
+                (PAGE_UP, RXVT_CTRL_SHIFT) => E(K::PageUp, M::CTRL_SHIFT),
+                (PAGE_DOWN, RXVT_CTRL) => E(K::PageDown, M::CTRL),
+                (PAGE_DOWN, RXVT_SHIFT) => E(K::PageDown, M::SHIFT),
+                (PAGE_DOWN, RXVT_CTRL_SHIFT) => E(K::PageDown, M::CTRL_SHIFT),
+                (RXVT_HOME, RXVT_CTRL) => E(K::Home, M::CTRL),
+                (RXVT_HOME, RXVT_SHIFT) => E(K::Home, M::SHIFT),
+                (RXVT_HOME, RXVT_CTRL_SHIFT) => E(K::Home, M::CTRL_SHIFT),
+                (RXVT_END, RXVT_CTRL) => E(K::End, M::CTRL), // kEND5 or kel
+                (RXVT_END, RXVT_SHIFT) => E(K::End, M::SHIFT),
+                (RXVT_END, RXVT_CTRL_SHIFT) => E(K::End, M::CTRL_SHIFT),
                 _ => {
                     debug!(target: "rustyline",
-                           "unsupported esc sequence: ESC [ {} {:?}", seq2, seq3);
-                    KeyPress::UnknownEscSeq
+                           "unsupported esc sequence: \\E[{}{:?}", seq2, seq3);
+                    E(K::UnknownEscSeq, M::NONE)
                 }
             })
         }
     }
 
-    /// Handle ESC O <seq2> escape sequences
-    fn escape_o(&mut self) -> Result<KeyPress> {
+    /// Handle \EO <seq2> escape sequences
+    fn escape_o(&mut self) -> Result<KeyEvent> {
         let seq2 = self.next_char()?;
         Ok(match seq2 {
-            'A' => KeyPress::Up,    // kcuu1
-            'B' => KeyPress::Down,  // kcud1
-            'C' => KeyPress::Right, // kcuf1
-            'D' => KeyPress::Left,  // kcub1
-            'F' => KeyPress::End,   // kend
-            'H' => KeyPress::Home,  // khome
-            'P' => KeyPress::F(1),  // kf1
-            'Q' => KeyPress::F(2),  // kf2
-            'R' => KeyPress::F(3),  // kf3
-            'S' => KeyPress::F(4),  // kf4
-            'a' => KeyPress::ControlUp,
-            'b' => KeyPress::ControlDown,
-            'c' => KeyPress::ControlRight, // rxvt
-            'd' => KeyPress::ControlLeft,  // rxvt
+            UP => E(K::Up, M::NONE),
+            DOWN => E(K::Down, M::NONE),
+            RIGHT => E(K::Right, M::NONE),
+            LEFT => E(K::Left, M::NONE),
+            //'E' => E(K::, M::),// key_b2, kb2
+            END => E(K::End, M::NONE),   // kend
+            HOME => E(K::Home, M::NONE), // khome
+            'M' => E::ENTER,             // kent
+            'P' => E(K::F(1), M::NONE),  // kf1
+            'Q' => E(K::F(2), M::NONE),  // kf2
+            'R' => E(K::F(3), M::NONE),  // kf3
+            'S' => E(K::F(4), M::NONE),  // kf4
+            'a' => E(K::Up, M::CTRL),
+            'b' => E(K::Down, M::CTRL),
+            'c' => E(K::Right, M::CTRL), // rxvt
+            'd' => E(K::Left, M::CTRL),  // rxvt
+            'l' => E(K::F(8), M::NONE),
+            't' => E(K::F(5), M::NONE),  // kf5 or kb1
+            'u' => E(K::F(6), M::NONE),  // kf6 or kb2
+            'v' => E(K::F(7), M::NONE),  // kf7 or kb3
+            'w' => E(K::F(9), M::NONE),  // kf9 or ka1
+            'x' => E(K::F(10), M::NONE), // kf10 or ka2
             _ => {
-                debug!(target: "rustyline", "unsupported esc sequence: ESC O {:?}", seq2);
-                KeyPress::UnknownEscSeq
+                debug!(target: "rustyline", "unsupported esc sequence: \\EO{:?}", seq2);
+                E(K::UnknownEscSeq, M::NONE)
             }
         })
     }
 
-    fn poll(&mut self, timeout_ms: i32) -> ::nix::Result<i32> {
-        let mut fds = [poll::PollFd::new(STDIN_FILENO, PollFlags::POLLIN)];
-        poll::poll(&mut fds, timeout_ms)
+    fn poll(&mut self, timeout_ms: i32) -> Result<i32> {
+        let n = self.tty_in.buffer().len();
+        if n > 0 {
+            return Ok(n as i32);
+        }
+        let mut fds = [poll::PollFd::new(self.as_raw_fd(), PollFlags::POLLIN)];
+        let r = poll::poll(&mut fds, timeout_ms);
+        match r {
+            Ok(n) => Ok(n),
+            Err(Errno::EINTR) => {
+                if self.tty_in.get_ref().sigwinch()? {
+                    Err(ReadlineError::WindowResized)
+                } else {
+                    Ok(0) // Ignore EINTR while polling
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn select(&mut self, single_esc_abort: bool) -> Result<Event> {
+        let tty_in = self.as_raw_fd();
+        let sigwinch_pipe = self.tty_in.get_ref().sigwinch_pipe;
+        let pipe_reader = self
+            .pipe_reader
+            .as_ref()
+            .map(|pr| pr.lock().unwrap().0.as_raw_fd());
+        loop {
+            let mut readfds = self.fds;
+            readfds.clear();
+            if let Some(sigwinch_pipe) = sigwinch_pipe {
+                readfds.insert(sigwinch_pipe);
+            }
+            readfds.insert(tty_in);
+            if let Some(pipe_reader) = pipe_reader {
+                readfds.insert(pipe_reader);
+            }
+            if let Err(err) = select::select(
+                readfds.highest().map(|h| h + 1),
+                Some(&mut readfds),
+                None,
+                None,
+                None,
+            ) {
+                if err == Errno::EINTR && self.tty_in.get_ref().sigwinch()? {
+                    return Err(ReadlineError::WindowResized);
+                } else if err != Errno::EINTR {
+                    return Err(err.into());
+                } else {
+                    continue;
+                }
+            };
+            if sigwinch_pipe.map_or(false, |fd| readfds.contains(fd)) {
+                self.tty_in.get_ref().sigwinch()?;
+                return Err(ReadlineError::WindowResized);
+            } else if readfds.contains(tty_in) {
+                // prefer user input over external print
+                return self.next_key(single_esc_abort).map(Event::KeyPress);
+            } else if let Some(ref pipe_reader) = self.pipe_reader {
+                let mut guard = pipe_reader.lock().unwrap();
+                let mut buf = [0; 1];
+                guard.0.read_exact(&mut buf)?;
+                if let Ok(msg) = guard.1.try_recv() {
+                    return Ok(Event::ExternalPrint(msg));
+                }
+            }
+        }
     }
 }
 
 impl RawReader for PosixRawReader {
-    fn next_key(&mut self, single_esc_abort: bool) -> Result<KeyPress> {
+    #[cfg(not(feature = "signal-hook"))]
+    fn wait_for_input(&mut self, single_esc_abort: bool) -> Result<Event> {
+        match self.pipe_reader {
+            Some(_) => self.select(single_esc_abort),
+            None => self.next_key(single_esc_abort).map(Event::KeyPress),
+        }
+    }
+
+    #[cfg(feature = "signal-hook")]
+    fn wait_for_input(&mut self, single_esc_abort: bool) -> Result<Event> {
+        self.select(single_esc_abort)
+    }
+
+    fn next_key(&mut self, single_esc_abort: bool) -> Result<KeyEvent> {
         let c = self.next_char()?;
 
-        let mut key = keys::char_to_key_press(c);
-        if key == KeyPress::Esc {
+        let mut key = KeyEvent::new(c, M::NONE);
+        if key == E::ESC {
+            if !self.tty_in.buffer().is_empty() {
+                debug!(target: "rustyline", "read buffer {:?}", self.tty_in.buffer());
+            }
             let timeout_ms = if single_esc_abort && self.timeout_ms == -1 {
                 0
             } else {
@@ -399,24 +785,29 @@ impl RawReader for PosixRawReader {
                     key = self.escape_sequence()?
                 }
                 // Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
-        debug!(target: "rustyline", "key: {:?}", key);
+        debug!(target: "rustyline", "c: {:?} => key: {:?}", c, key);
         Ok(key)
     }
 
     fn next_char(&mut self) -> Result<char> {
+        let mut buf = [0; 1];
+        let mut receiver = Utf8 {
+            c: None,
+            valid: true,
+        };
         loop {
-            let n = self.stdin.read(&mut self.buf)?;
+            let n = self.tty_in.read(&mut buf)?;
             if n == 0 {
-                return Err(error::ReadlineError::Eof);
+                return Err(ReadlineError::Eof);
             }
-            let b = self.buf[0];
-            self.parser.advance(&mut self.receiver, b);
-            if !self.receiver.valid {
-                return Err(error::ReadlineError::Utf8Error);
-            } else if let Some(c) = self.receiver.c.take() {
+            let b = buf[0];
+            self.parser.advance(&mut receiver, b);
+            if !receiver.valid {
+                return Err(ReadlineError::from(ErrorKind::InvalidData));
+            } else if let Some(c) = receiver.c.take() {
                 return Ok(c);
             }
         }
@@ -428,7 +819,7 @@ impl RawReader for PosixRawReader {
             match self.next_char()? {
                 '\x1b' => {
                     let key = self.escape_sequence()?;
-                    if key == KeyPress::BracketedPasteEnd {
+                    if key == E(K::BracketedPasteEnd, M::NONE) {
                         break;
                     } else {
                         continue; // TODO validate
@@ -438,8 +829,16 @@ impl RawReader for PosixRawReader {
             };
         }
         let buffer = buffer.replace("\r\n", "\n");
-        let buffer = buffer.replace("\r", "\n");
+        let buffer = buffer.replace('\r', "\n");
         Ok(buffer)
+    }
+
+    fn find_binding(&self, key: &KeyEvent) -> Option<Cmd> {
+        let cmd = self.key_map.get(key).cloned();
+        if let Some(ref cmd) = cmd {
+            debug!(target: "rustyline", "terminal key binding: {:?} => {:?}", key, cmd);
+        }
+        cmd
     }
 }
 
@@ -459,7 +858,7 @@ impl Receiver for Utf8 {
 
 /// Console output writer
 pub struct PosixRenderer {
-    out: OutputStreamType,
+    out: RawFd,
     cols: usize, // Number of columns in terminal
     buffer: String,
     tab_stop: usize,
@@ -468,13 +867,8 @@ pub struct PosixRenderer {
 }
 
 impl PosixRenderer {
-    fn new(
-        out: OutputStreamType,
-        tab_stop: usize,
-        colors_enabled: bool,
-        bell_style: BellStyle,
-    ) -> Self {
-        let (cols, _) = get_win_size(&out);
+    fn new(out: RawFd, tab_stop: usize, colors_enabled: bool, bell_style: BellStyle) -> Self {
+        let (cols, _) = get_win_size(out);
         Self {
             out,
             cols,
@@ -494,14 +888,14 @@ impl PosixRenderer {
         let cursor_row_movement = old_rows.saturating_sub(current_row);
         // move the cursor down as required
         if cursor_row_movement > 0 {
-            write!(self.buffer, "\x1b[{}B", cursor_row_movement).unwrap();
+            write!(self.buffer, "\x1b[{cursor_row_movement}B").unwrap();
         }
         // clear old rows
         for _ in 0..old_rows {
-            self.buffer.push_str("\r\x1b[0K\x1b[A");
+            self.buffer.push_str("\r\x1b[K\x1b[A");
         }
         // clear the line
-        self.buffer.push_str("\r\x1b[0K");
+        self.buffer.push_str("\r\x1b[K");
     }
 }
 
@@ -512,42 +906,43 @@ impl Renderer for PosixRenderer {
         use std::fmt::Write;
         self.buffer.clear();
         let row_ordering = new.row.cmp(&old.row);
-        if row_ordering == Ordering::Greater {
+        if row_ordering == cmp::Ordering::Greater {
             // move down
             let row_shift = new.row - old.row;
             if row_shift == 1 {
                 self.buffer.push_str("\x1b[B");
             } else {
-                write!(self.buffer, "\x1b[{}B", row_shift).unwrap();
+                write!(self.buffer, "\x1b[{row_shift}B")?;
             }
-        } else if row_ordering == Ordering::Less {
+        } else if row_ordering == cmp::Ordering::Less {
             // move up
             let row_shift = old.row - new.row;
             if row_shift == 1 {
                 self.buffer.push_str("\x1b[A");
             } else {
-                write!(self.buffer, "\x1b[{}A", row_shift).unwrap();
+                write!(self.buffer, "\x1b[{row_shift}A")?;
             }
         }
         let col_ordering = new.col.cmp(&old.col);
-        if col_ordering == Ordering::Greater {
+        if col_ordering == cmp::Ordering::Greater {
             // move right
             let col_shift = new.col - old.col;
             if col_shift == 1 {
                 self.buffer.push_str("\x1b[C");
             } else {
-                write!(self.buffer, "\x1b[{}C", col_shift).unwrap();
+                write!(self.buffer, "\x1b[{col_shift}C")?;
             }
-        } else if col_ordering == Ordering::Less {
+        } else if col_ordering == cmp::Ordering::Less {
             // move left
             let col_shift = old.col - new.col;
             if col_shift == 1 {
                 self.buffer.push_str("\x1b[D");
             } else {
-                write!(self.buffer, "\x1b[{}D", col_shift).unwrap();
+                write!(self.buffer, "\x1b[{col_shift}D")?;
             }
         }
-        self.write_and_flush(self.buffer.as_bytes())
+        write_all(self.out, self.buffer.as_str())?;
+        Ok(())
     }
 
     fn refresh_line(
@@ -590,14 +985,19 @@ impl Renderer for PosixRenderer {
             }
         }
         // we have to generate our own newline on line wrap
-        if end_pos.col == 0 && end_pos.row > 0 && !self.buffer.ends_with('\n') {
-            self.buffer.push_str("\n");
+        if end_pos.col == 0
+            && end_pos.row > 0
+            && !hint
+                .map(|h| h.ends_with('\n'))
+                .unwrap_or_else(|| line.ends_with('\n'))
+        {
+            self.buffer.push('\n');
         }
         // position the cursor
         let new_cursor_row_movement = end_pos.row - cursor.row;
         // move the cursor up as required
         if new_cursor_row_movement > 0 {
-            write!(self.buffer, "\x1b[{}A", new_cursor_row_movement).unwrap();
+            write!(self.buffer, "\x1b[{new_cursor_row_movement}A")?;
         }
         // position the cursor within the line
         if cursor.col > 0 {
@@ -606,13 +1006,13 @@ impl Renderer for PosixRenderer {
             self.buffer.push('\r');
         }
 
-        self.write_and_flush(self.buffer.as_bytes())?;
-
+        write_all(self.out, self.buffer.as_str())?;
         Ok(())
     }
 
-    fn write_and_flush(&self, buf: &[u8]) -> Result<()> {
-        write_and_flush(self.out, buf)
+    fn write_and_flush(&mut self, buf: &str) -> Result<()> {
+        write_all(self.out, buf)?;
+        Ok(())
     }
 
     /// Control characters are treated as having zero width.
@@ -646,28 +1046,26 @@ impl Renderer for PosixRenderer {
 
     fn beep(&mut self) -> Result<()> {
         match self.bell_style {
-            BellStyle::Audible => {
-                io::stderr().write_all(b"\x07")?;
-                io::stderr().flush()?;
-                Ok(())
-            }
+            BellStyle::Audible => self.write_and_flush("\x07"),
             _ => Ok(()),
         }
     }
 
     /// Clear the screen. Used to handle ctrl+l
     fn clear_screen(&mut self) -> Result<()> {
-        self.write_and_flush(b"\x1b[H\x1b[2J")
+        self.write_and_flush("\x1b[H\x1b[J")
     }
 
-    /// Check if a SIGWINCH signal has been received
-    fn sigwinch(&self) -> bool {
-        SIGWINCH.compare_and_swap(true, false, atomic::Ordering::SeqCst)
+    fn clear_rows(&mut self, layout: &Layout) -> Result<()> {
+        self.buffer.clear();
+        self.clear_old_rows(layout);
+        write_all(self.out, self.buffer.as_str())?;
+        Ok(())
     }
 
     /// Try to update the number of columns in the current terminal,
     fn update_size(&mut self) {
-        let (cols, _) = get_win_size(&self.out);
+        let (cols, _) = get_win_size(self.out);
         self.cols = cols;
     }
 
@@ -678,7 +1076,7 @@ impl Renderer for PosixRenderer {
     /// Try to get the number of rows in the current terminal,
     /// or assume 24 if it fails.
     fn get_rows(&self) -> usize {
-        let (_, rows) = get_win_size(&self.out);
+        let (_, rows) = get_win_size(self.out);
         rows
     }
 
@@ -692,7 +1090,7 @@ impl Renderer for PosixRenderer {
             return Ok(());
         }
         /* Report cursor location */
-        self.write_and_flush(b"\x1b[6n")?;
+        self.write_and_flush("\x1b[6n")?;
         /* Read the response: ESC [ rows ; cols R */
         if rdr.poll(100)? == 0
             || rdr.next_char()? != '\x1b'
@@ -704,8 +1102,8 @@ impl Renderer for PosixRenderer {
         }
         let col = read_digits_until(rdr, 'R')?;
         debug!(target: "rustyline", "initial cursor location: {:?}", col);
-        if col.is_some() && col != Some(1) {
-            self.write_and_flush(b"\n")?;
+        if col != Some(1) {
+            self.write_and_flush("\n")?;
         }
         Ok(())
     }
@@ -728,23 +1126,87 @@ fn read_digits_until(rdr: &mut PosixRawReader, sep: char) -> Result<Option<u32>>
     Ok(Some(num))
 }
 
-static SIGWINCH_ONCE: sync::Once = sync::Once::new();
-static SIGWINCH: atomic::AtomicBool = atomic::AtomicBool::new(false);
+fn write_all(fd: RawFd, buf: &str) -> nix::Result<()> {
+    let mut bytes = buf.as_bytes();
+    while !bytes.is_empty() {
+        match write(fd, bytes) {
+            Ok(0) => return Err(Errno::EIO),
+            Ok(n) => bytes = &bytes[n..],
+            Err(Errno::EINTR) => {}
+            Err(r) => return Err(r),
+        }
+    }
+    Ok(())
+}
 
-fn install_sigwinch_handler() {
-    SIGWINCH_ONCE.call_once(|| unsafe {
+#[cfg(not(feature = "signal-hook"))]
+static mut SIGWINCH_PIPE: RawFd = -1;
+#[cfg(not(feature = "signal-hook"))]
+extern "C" fn sigwinch_handler(_: libc::c_int) {
+    let _ = unsafe { write(SIGWINCH_PIPE, &[b's']) };
+}
+
+#[derive(Clone, Debug)]
+struct SigWinCh {
+    pipe: RawFd,
+    #[cfg(not(feature = "signal-hook"))]
+    original: nix::sys::signal::SigAction,
+    #[cfg(feature = "signal-hook")]
+    id: signal_hook::SigId,
+}
+impl SigWinCh {
+    #[cfg(not(feature = "signal-hook"))]
+    fn install_sigwinch_handler() -> Result<SigWinCh> {
+        use nix::sys::signal;
+        let (pipe, pipe_write) = UnixStream::pair()?;
+        pipe.set_nonblocking(true)?;
+        unsafe { SIGWINCH_PIPE = pipe_write.into_raw_fd() };
         let sigwinch = signal::SigAction::new(
             signal::SigHandler::Handler(sigwinch_handler),
             signal::SaFlags::empty(),
             signal::SigSet::empty(),
         );
-        let _ = signal::sigaction(signal::SIGWINCH, &sigwinch);
-    });
+        let original = unsafe { signal::sigaction(signal::SIGWINCH, &sigwinch)? };
+        Ok(SigWinCh {
+            pipe: pipe.into_raw_fd(),
+            original,
+        })
+    }
+
+    #[cfg(feature = "signal-hook")]
+    fn install_sigwinch_handler() -> Result<SigWinCh> {
+        let (pipe, pipe_write) = UnixStream::pair()?;
+        pipe.set_nonblocking(true)?;
+        let id = signal_hook::low_level::pipe::register(libc::SIGWINCH, pipe_write)?;
+        Ok(SigWinCh {
+            pipe: pipe.into_raw_fd(),
+            id,
+        })
+    }
+
+    #[cfg(not(feature = "signal-hook"))]
+    fn uninstall_sigwinch_handler(self) -> Result<()> {
+        use nix::sys::signal;
+        let _ = unsafe { signal::sigaction(signal::SIGWINCH, &self.original)? };
+        close(self.pipe)?;
+        unsafe { close(SIGWINCH_PIPE)? };
+        unsafe { SIGWINCH_PIPE = -1 };
+        Ok(())
+    }
+
+    #[cfg(feature = "signal-hook")]
+    fn uninstall_sigwinch_handler(self) -> Result<()> {
+        signal_hook::low_level::unregister(self.id);
+        close(self.pipe)?;
+        Ok(())
+    }
 }
 
-extern "C" fn sigwinch_handler(_: libc::c_int) {
-    SIGWINCH.store(true, atomic::Ordering::SeqCst);
-    debug!(target: "rustyline", "SIGWINCH");
+fn map_key(key_map: &mut HashMap<KeyEvent, Cmd>, raw: &Termios, index: SCI, name: &str, cmd: Cmd) {
+    let cc = char::from(raw.control_chars[index as usize]);
+    let key = KeyEvent::new(cc, M::NONE);
+    debug!(target: "rustyline", "{}: {:?}", name, key);
+    key_map.insert(key, cmd);
 }
 
 #[cfg(not(test))]
@@ -753,18 +1215,27 @@ pub type Terminal = PosixTerminal;
 #[derive(Clone, Debug)]
 pub struct PosixTerminal {
     unsupported: bool,
-    stdin_isatty: bool,
-    stdstream_isatty: bool,
+    tty_in: RawFd,
+    is_in_a_tty: bool,
+    tty_out: RawFd,
+    is_out_a_tty: bool,
+    close_on_drop: bool,
     pub(crate) color_mode: ColorMode,
-    stream_type: OutputStreamType,
     tab_stop: usize,
     bell_style: BellStyle,
+    enable_bracketed_paste: bool,
+    raw_mode: Arc<AtomicBool>,
+    // external print reader
+    pipe_reader: Option<PipeReader>,
+    // external print writer
+    pipe_writer: Option<PipeWriter>,
+    sigwinch: Option<SigWinCh>,
 }
 
 impl PosixTerminal {
     fn colors_enabled(&self) -> bool {
         match self.color_mode {
-            ColorMode::Enabled => self.stdstream_isatty,
+            ColorMode::Enabled => self.is_out_a_tty,
             ColorMode::Forced => true,
             ColorMode::Disabled => false,
         }
@@ -772,29 +1243,67 @@ impl PosixTerminal {
 }
 
 impl Term for PosixTerminal {
+    type ExternalPrinter = ExternalPrinter;
+    type KeyMap = PosixKeyMap;
     type Mode = PosixMode;
     type Reader = PosixRawReader;
     type Writer = PosixRenderer;
 
     fn new(
         color_mode: ColorMode,
-        stream_type: OutputStreamType,
+        behavior: Behavior,
         tab_stop: usize,
         bell_style: BellStyle,
-    ) -> Self {
-        let term = Self {
-            unsupported: is_unsupported_term(),
-            stdin_isatty: is_a_tty(STDIN_FILENO),
-            stdstream_isatty: is_a_tty(stream_type.as_raw_fd()),
+        enable_bracketed_paste: bool,
+    ) -> Result<Self> {
+        let (tty_in, is_in_a_tty, tty_out, is_out_a_tty, close_on_drop) =
+            if behavior == Behavior::PreferTerm {
+                let tty = OpenOptions::new().read(true).write(true).open("/dev/tty");
+                if let Ok(tty) = tty {
+                    let fd = tty.into_raw_fd();
+                    let is_a_tty = is_a_tty(fd); // TODO: useless ?
+                    (fd, is_a_tty, fd, is_a_tty, true)
+                } else {
+                    (
+                        libc::STDIN_FILENO,
+                        is_a_tty(libc::STDIN_FILENO),
+                        libc::STDOUT_FILENO,
+                        is_a_tty(libc::STDOUT_FILENO),
+                        false,
+                    )
+                }
+            } else {
+                (
+                    libc::STDIN_FILENO,
+                    is_a_tty(libc::STDIN_FILENO),
+                    libc::STDOUT_FILENO,
+                    is_a_tty(libc::STDOUT_FILENO),
+                    false,
+                )
+            };
+        let unsupported = is_unsupported_term();
+        #[allow(unused_variables)]
+        let sigwinch = if !unsupported && is_in_a_tty && is_out_a_tty {
+            Some(SigWinCh::install_sigwinch_handler()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            unsupported,
+            tty_in,
+            is_in_a_tty,
+            tty_out,
+            is_out_a_tty,
+            close_on_drop,
             color_mode,
-            stream_type,
             tab_stop,
             bell_style,
-        };
-        if !term.unsupported && term.stdin_isatty && term.stdstream_isatty {
-            install_sigwinch_handler();
-        }
-        term
+            enable_bracketed_paste,
+            raw_mode: Arc::new(AtomicBool::new(false)),
+            pipe_reader: None,
+            pipe_writer: None,
+            sigwinch,
+        })
     }
 
     // Init checks:
@@ -805,24 +1314,23 @@ impl Term for PosixTerminal {
         self.unsupported
     }
 
-    /// check if stdin is connected to a terminal.
-    fn is_stdin_tty(&self) -> bool {
-        self.stdin_isatty
+    fn is_input_tty(&self) -> bool {
+        self.is_in_a_tty
     }
 
     fn is_output_tty(&self) -> bool {
-        self.stdstream_isatty
+        self.is_out_a_tty
     }
 
     // Interactive loop:
 
-    fn enable_raw_mode(&mut self) -> Result<Self::Mode> {
+    fn enable_raw_mode(&mut self) -> Result<(Self::Mode, PosixKeyMap)> {
         use nix::errno::Errno::ENOTTY;
-        use nix::sys::termios::{ControlFlags, InputFlags, LocalFlags, SpecialCharacterIndices};
-        if !self.stdin_isatty {
-            return Err(nix::Error::from_errno(ENOTTY).into());
+        use nix::sys::termios::{ControlFlags, InputFlags, LocalFlags};
+        if !self.is_in_a_tty {
+            return Err(ENOTTY.into());
         }
-        let original_mode = termios::tcgetattr(STDIN_FILENO)?;
+        let original_mode = termios::tcgetattr(self.tty_in)?;
         let mut raw = original_mode.clone();
         // disable BREAK interrupt, CR to NL conversion on input,
         // input parity check, strip high bit (bit 8), output flow control
@@ -840,70 +1348,158 @@ impl Term for PosixTerminal {
         // disable echoing, canonical mode, extended input processing and signals
         raw.local_flags &=
             !(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::IEXTEN | LocalFlags::ISIG);
-        raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 1; // One character-at-a-time input
-        raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0; // with blocking read
-        termios::tcsetattr(STDIN_FILENO, SetArg::TCSADRAIN, &raw)?;
+        raw.control_chars[SCI::VMIN as usize] = 1; // One character-at-a-time input
+        raw.control_chars[SCI::VTIME as usize] = 0; // with blocking read
 
+        let mut key_map: HashMap<KeyEvent, Cmd> = HashMap::with_capacity(4);
+        map_key(&mut key_map, &raw, SCI::VEOF, "VEOF", Cmd::EndOfFile);
+        map_key(&mut key_map, &raw, SCI::VINTR, "VINTR", Cmd::Interrupt);
+        map_key(&mut key_map, &raw, SCI::VQUIT, "VQUIT", Cmd::Interrupt);
+        map_key(&mut key_map, &raw, SCI::VSUSP, "VSUSP", Cmd::Suspend);
+
+        termios::tcsetattr(self.tty_in, SetArg::TCSADRAIN, &raw)?;
+
+        self.raw_mode.store(true, Ordering::SeqCst);
         // enable bracketed paste
-        let out = if let Err(e) = write_and_flush(self.stream_type, BRACKETED_PASTE_ON) {
+        let out = if !self.enable_bracketed_paste {
+            None
+        } else if let Err(e) = write_all(self.tty_out, BRACKETED_PASTE_ON) {
             debug!(target: "rustyline", "Cannot enable bracketed paste: {}", e);
             None
         } else {
-            Some(self.stream_type)
+            Some(self.tty_out)
         };
-        Ok(PosixMode {
-            termios: original_mode,
-            out,
-        })
+
+        // when all ExternalPrinter are dropped there is no need to use `pipe_reader`
+        if Arc::strong_count(&self.raw_mode) == 1 {
+            self.pipe_writer = None;
+            self.pipe_reader = None;
+        }
+
+        Ok((
+            PosixMode {
+                termios: original_mode,
+                tty_in: self.tty_in,
+                tty_out: out,
+                raw_mode: self.raw_mode.clone(),
+            },
+            key_map,
+        ))
     }
 
     /// Create a RAW reader
-    fn create_reader(&self, config: &Config) -> Result<PosixRawReader> {
-        PosixRawReader::new(config)
+    fn create_reader(&self, config: &Config, key_map: PosixKeyMap) -> PosixRawReader {
+        PosixRawReader::new(
+            self.tty_in,
+            self.sigwinch.as_ref().map(|s| s.pipe),
+            config,
+            key_map,
+            self.pipe_reader.clone(),
+        )
     }
 
     fn create_writer(&self) -> PosixRenderer {
         PosixRenderer::new(
-            self.stream_type,
+            self.tty_out,
             self.tab_stop,
             self.colors_enabled(),
             self.bell_style,
         )
     }
+
+    fn writeln(&self) -> Result<()> {
+        write_all(self.tty_out, "\n")?;
+        Ok(())
+    }
+
+    fn create_external_printer(&mut self) -> Result<ExternalPrinter> {
+        if let Some(ref writer) = self.pipe_writer {
+            return Ok(ExternalPrinter {
+                writer: writer.clone(),
+                raw_mode: self.raw_mode.clone(),
+                tty_out: self.tty_out,
+            });
+        }
+        if self.unsupported || !self.is_input_tty() || !self.is_output_tty() {
+            return Err(nix::Error::ENOTTY.into());
+        }
+        use nix::unistd::pipe;
+        use std::os::unix::io::FromRawFd;
+        let (sender, receiver) = mpsc::sync_channel(1); // TODO validate: bound
+        let (r, w) = pipe()?;
+        let reader = Arc::new(Mutex::new((unsafe { File::from_raw_fd(r) }, receiver)));
+        let writer = (
+            Arc::new(Mutex::new(unsafe { File::from_raw_fd(w) })),
+            sender,
+        );
+        self.pipe_reader.replace(reader);
+        self.pipe_writer.replace(writer.clone());
+        Ok(ExternalPrinter {
+            writer,
+            raw_mode: self.raw_mode.clone(),
+            tty_out: self.tty_out,
+        })
+    }
+}
+
+#[allow(unused_must_use)]
+impl Drop for PosixTerminal {
+    fn drop(&mut self) {
+        if self.close_on_drop {
+            close(self.tty_in);
+            debug_assert_eq!(self.tty_in, self.tty_out);
+        }
+        if let Some(sigwinch) = self.sigwinch.take() {
+            sigwinch.uninstall_sigwinch_handler();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ExternalPrinter {
+    writer: PipeWriter,
+    raw_mode: Arc<AtomicBool>,
+    tty_out: RawFd,
+}
+
+impl super::ExternalPrinter for ExternalPrinter {
+    fn print(&mut self, msg: String) -> Result<()> {
+        // write directly to stdout/stderr while not in raw mode
+        if !self.raw_mode.load(Ordering::SeqCst) {
+            write_all(self.tty_out, msg.as_str())?;
+        } else if let Ok(mut writer) = self.writer.0.lock() {
+            self.writer
+                .1
+                .send(msg)
+                .map_err(|_| io::Error::from(ErrorKind::Other))?; // FIXME
+            writer.write_all(&[b'm'])?;
+            writer.flush()?;
+        } else {
+            return Err(io::Error::from(ErrorKind::Other).into()); // FIXME
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(test))]
 pub fn suspend() -> Result<()> {
+    use nix::sys::signal;
     use nix::unistd::Pid;
     // suspend the whole process group
     signal::kill(Pid::from_raw(0), signal::SIGTSTP)?;
     Ok(())
 }
 
-fn write_and_flush(out: OutputStreamType, buf: &[u8]) -> Result<()> {
-    match out {
-        OutputStreamType::Stdout => {
-            io::stdout().write_all(buf)?;
-            io::stdout().flush()?;
-        }
-        OutputStreamType::Stderr => {
-            io::stderr().write_all(buf)?;
-            io::stderr().flush()?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod test {
     use super::{Position, PosixRenderer, PosixTerminal, Renderer};
-    use crate::config::{BellStyle, OutputStreamType};
-    use crate::line_buffer::LineBuffer;
+    use crate::config::BellStyle;
+    use crate::line_buffer::{LineBuffer, NoListener};
 
     #[test]
     #[ignore]
     fn prompt_with_ansi_escape_codes() {
-        let out = PosixRenderer::new(OutputStreamType::Stdout, 4, true, BellStyle::default());
+        let out = PosixRenderer::new(libc::STDOUT_FILENO, 4, true, BellStyle::default());
         let pos = out.calculate_position("\x1b[1;32m>>\x1b[0m ", Position::default());
         assert_eq!(3, pos.col);
         assert_eq!(0, pos.row);
@@ -911,11 +1507,11 @@ mod test {
 
     #[test]
     fn test_unsupported_term() {
-        ::std::env::set_var("TERM", "xterm");
-        assert_eq!(false, super::is_unsupported_term());
+        std::env::set_var("TERM", "xterm");
+        assert!(!super::is_unsupported_term());
 
-        ::std::env::set_var("TERM", "dumb");
-        assert_eq!(true, super::is_unsupported_term());
+        std::env::set_var("TERM", "dumb");
+        assert!(super::is_unsupported_term());
     }
 
     #[test]
@@ -932,17 +1528,20 @@ mod test {
 
     #[test]
     fn test_line_wrap() {
-        let mut out = PosixRenderer::new(OutputStreamType::Stdout, 4, true, BellStyle::default());
+        let mut out = PosixRenderer::new(libc::STDOUT_FILENO, 4, true, BellStyle::default());
         let prompt = "> ";
         let default_prompt = true;
         let prompt_size = out.calculate_position(prompt, Position::default());
 
-        let mut line = LineBuffer::init("", 0, None);
+        let mut line = LineBuffer::init("", 0);
         let old_layout = out.compute_layout(prompt_size, default_prompt, &line, None);
         assert_eq!(Position { col: 2, row: 0 }, old_layout.cursor);
         assert_eq!(old_layout.cursor, old_layout.end);
 
-        assert_eq!(Some(true), line.insert('a', out.cols - prompt_size.col + 1));
+        assert_eq!(
+            Some(true),
+            line.insert('a', out.cols - prompt_size.col + 1, &mut NoListener)
+        );
         let new_layout = out.compute_layout(prompt_size, default_prompt, &line, None);
         assert_eq!(Position { col: 1, row: 1 }, new_layout.cursor);
         assert_eq!(new_layout.cursor, new_layout.end);
@@ -950,7 +1549,7 @@ mod test {
             .unwrap();
         #[rustfmt::skip]
         assert_eq!(
-            "\r\u{1b}[0K> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\u{1b}[1C",
+            "\r\u{1b}[K> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\u{1b}[1C",
             out.buffer
         );
     }

@@ -1,7 +1,6 @@
 //! Syntax highlighting
 
 use crate::config::CompletionType;
-use memchr::memchr;
 use std::borrow::Cow::{self, Borrowed, Owned};
 use std::cell::Cell;
 
@@ -42,7 +41,7 @@ pub trait Highlighter {
     /// Currently, used only with `CompletionType::List`.
     fn highlight_candidate<'c>(
         &self,
-        candidate: &'c str,
+        candidate: &'c str, // FIXME should be Completer::Candidate
         completion: CompletionType,
     ) -> Cow<'c, str> {
         let _ = completion;
@@ -91,8 +90,7 @@ impl<'r, H: ?Sized + Highlighter> Highlighter for &'r H {
     }
 }
 
-const OPENS: &[u8; 3] = b"{[(";
-const CLOSES: &[u8; 3] = b"}])";
+// TODO versus https://python-prompt-toolkit.readthedocs.io/en/master/pages/reference.html?highlight=HighlightMatchingBracketProcessor#prompt_toolkit.layout.processors.HighlightMatchingBracketProcessor
 
 /// Highlight matching bracket when typed or cursor moved on.
 #[derive(Default)]
@@ -102,6 +100,7 @@ pub struct MatchingBracketHighlighter {
 
 impl MatchingBracketHighlighter {
     /// Constructor
+    #[must_use]
     pub fn new() -> Self {
         Self {
             bracket: Cell::new(None),
@@ -193,17 +192,13 @@ fn check_bracket(line: &str, pos: usize) -> Option<(u8, usize)> {
         loop {
             let b = line.as_bytes()[pos];
             if is_close_bracket(b) {
-                if pos == 0 {
-                    return None;
-                } else {
-                    return Some((b, pos));
-                }
+                return if pos == 0 { None } else { Some((b, pos)) };
             } else if is_open_bracket(b) {
-                if pos + 1 == line.len() {
-                    return None;
+                return if pos + 1 == line.len() {
+                    None
                 } else {
-                    return Some((b, pos));
-                }
+                    Some((b, pos))
+                };
             } else if under_cursor && pos > 0 {
                 under_cursor = false;
                 pos -= 1; // or before cursor
@@ -214,7 +209,7 @@ fn check_bracket(line: &str, pos: usize) -> Option<(u8, usize)> {
     }
 }
 
-fn matching_bracket(bracket: u8) -> u8 {
+const fn matching_bracket(bracket: u8) -> u8 {
     match bracket {
         b'{' => b'}',
         b'}' => b'{',
@@ -225,11 +220,11 @@ fn matching_bracket(bracket: u8) -> u8 {
         b => b,
     }
 }
-fn is_open_bracket(bracket: u8) -> bool {
-    memchr(bracket, OPENS).is_some()
+const fn is_open_bracket(bracket: u8) -> bool {
+    matches!(bracket, b'{' | b'[' | b'(')
 }
-fn is_close_bracket(bracket: u8) -> bool {
-    memchr(bracket, CLOSES).is_some()
+const fn is_close_bracket(bracket: u8) -> bool {
+    matches!(bracket, b'}' | b']' | b')')
 }
 
 #[cfg(test)]

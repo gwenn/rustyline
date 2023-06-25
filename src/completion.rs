@@ -5,12 +5,6 @@ use std::path::{self, Path};
 
 use crate::line_buffer::LineBuffer;
 use crate::{Context, Result};
-use memchr::memchr;
-
-// TODO: let the implementers choose/find word boundaries ???
-// (line, pos) is like (rl_line_buffer, rl_point) to make contextual completion
-// ("select t.na| from tbl as t")
-// TODO: make &self &mut self ???
 
 /// A completion candidate.
 pub trait Candidate {
@@ -30,7 +24,29 @@ impl Candidate for String {
     }
 }
 
+/// #[deprecated = "Unusable"]
+impl Candidate for str {
+    fn display(&self) -> &str {
+        self
+    }
+
+    fn replacement(&self) -> &str {
+        self
+    }
+}
+
+impl Candidate for &'_ str {
+    fn display(&self) -> &str {
+        self
+    }
+
+    fn replacement(&self) -> &str {
+        self
+    }
+}
+
 /// Completion candidate pair
+#[derive(Clone)]
 pub struct Pair {
     /// Text to display when listing alternatives.
     pub display: String,
@@ -48,10 +64,15 @@ impl Candidate for Pair {
     }
 }
 
+// TODO: let the implementers customize how the candidate(s) are displayed
+// https://github.com/kkawakam/rustyline/issues/302
+
 /// To be called for tab-completion.
 pub trait Completer {
     /// Specific completion candidate.
     type Candidate: Candidate;
+
+    // TODO: let the implementers choose/find word boundaries ??? => Lexer
 
     /// Takes the currently edited `line` with the cursor `pos`ition and
     /// returns the start position and the completion candidates for the
@@ -59,7 +80,7 @@ pub trait Completer {
     ///
     /// ("ls /usr/loc", 11) => Ok((3, vec!["/usr/local/"]))
     fn complete(
-        &self,
+        &self, // FIXME should be `&mut self`
         line: &str,
         pos: usize,
         ctx: &Context<'_>,
@@ -68,17 +89,17 @@ pub trait Completer {
         Ok((0, Vec::with_capacity(0)))
     }
     /// Updates the edited `line` with the `elected` candidate.
-    fn update(&self, line: &mut LineBuffer, start: usize, elected: &str) {
+    fn update(&self, line: &mut LineBuffer, start: usize, elected: &str, cl: &mut Changeset) {
         let end = line.pos();
-        line.replace(start..end, elected)
+        line.replace(start..end, elected, cl);
     }
 }
 
 impl Completer for () {
     type Candidate = String;
 
-    fn update(&self, _line: &mut LineBuffer, _start: usize, _elected: &str) {
-        unreachable!()
+    fn update(&self, _line: &mut LineBuffer, _start: usize, _elected: &str, _cl: &mut Changeset) {
+        unreachable!();
     }
 }
 
@@ -94,8 +115,8 @@ impl<'c, C: ?Sized + Completer> Completer for &'c C {
         (**self).complete(line, pos, ctx)
     }
 
-    fn update(&self, line: &mut LineBuffer, start: usize, elected: &str) {
-        (**self).update(line, start, elected)
+    fn update(&self, line: &mut LineBuffer, start: usize, elected: &str, cl: &mut Changeset) {
+        (**self).update(line, start, elected, cl);
     }
 }
 macro_rules! box_completer {
@@ -107,22 +128,23 @@ macro_rules! box_completer {
                 fn complete(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Result<(usize, Vec<Self::Candidate>)> {
                     (**self).complete(line, pos, ctx)
                 }
-                fn update(&self, line: &mut LineBuffer, start: usize, elected: &str) {
-                    (**self).update(line, start, elected)
+                fn update(&self, line: &mut LineBuffer, start: usize, elected: &str, cl: &mut Changeset) {
+                    (**self).update(line, start, elected, cl)
                 }
             }
         )*
     }
 }
 
+use crate::undo::Changeset;
 use std::rc::Rc;
 use std::sync::Arc;
 box_completer! { Box Rc Arc }
 
 /// A `Completer` for file and folder names.
 pub struct FilenameCompleter {
-    break_chars: &'static [u8],
-    double_quotes_special_chars: &'static [u8],
+    break_chars: fn(char) -> bool,
+    double_quotes_special_chars: fn(char) -> bool,
 }
 
 const DOUBLE_QUOTES_ESCAPE_CHAR: Option<char> = Some('\\');
@@ -130,31 +152,31 @@ const DOUBLE_QUOTES_ESCAPE_CHAR: Option<char> = Some('\\');
 cfg_if::cfg_if! {
     if #[cfg(unix)] {
         // rl_basic_word_break_characters, rl_completer_word_break_characters
-        const DEFAULT_BREAK_CHARS: [u8; 18] = [
-            b' ', b'\t', b'\n', b'"', b'\\', b'\'', b'`', b'@', b'$', b'>', b'<', b'=', b';', b'|', b'&',
-            b'{', b'(', b'\0',
-        ];
+        const fn default_break_chars(c : char) -> bool {
+            matches!(c, ' ' | '\t' | '\n' | '"' | '\\' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' |
+            '{' | '(' | '\0')
+        }
         const ESCAPE_CHAR: Option<char> = Some('\\');
         // In double quotes, not all break_chars need to be escaped
         // https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
-        const DOUBLE_QUOTES_SPECIAL_CHARS: [u8; 4] = [b'"', b'$', b'\\', b'`'];
+        const fn double_quotes_special_chars(c: char) -> bool { matches!(c, '"' | '$' | '\\' | '`') }
     } else if #[cfg(windows)] {
         // Remove \ to make file completion works on windows
-        const DEFAULT_BREAK_CHARS: [u8; 17] = [
-            b' ', b'\t', b'\n', b'"', b'\'', b'`', b'@', b'$', b'>', b'<', b'=', b';', b'|', b'&', b'{',
-            b'(', b'\0',
-        ];
+        const fn default_break_chars(c: char) -> bool {
+            matches!(c, ' ' | '\t' | '\n' | '"' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' | '{' |
+            '(' | '\0')
+        }
         const ESCAPE_CHAR: Option<char> = None;
-        const DOUBLE_QUOTES_SPECIAL_CHARS: [u8; 1] = [b'"']; // TODO Validate: only '"' ?
+        const fn double_quotes_special_chars(c: char) -> bool { c == '"' } // TODO Validate: only '"' ?
     } else if #[cfg(target_arch = "wasm32")] {
-        const DEFAULT_BREAK_CHARS: [u8; 0] = [];
+        const fn default_break_chars(c: char) -> bool { false }
         const ESCAPE_CHAR: Option<char> = None;
-        const DOUBLE_QUOTES_SPECIAL_CHARS: [u8; 0] = [];
+        const fn double_quotes_special_chars(c: char) -> bool { false }
     }
 }
 
 /// Kind of quote.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Quote {
     /// Double quote: `"`
     Double,
@@ -166,10 +188,11 @@ pub enum Quote {
 
 impl FilenameCompleter {
     /// Constructor
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            break_chars: &DEFAULT_BREAK_CHARS,
-            double_quotes_special_chars: &DOUBLE_QUOTES_SPECIAL_CHARS,
+            break_chars: default_break_chars,
+            double_quotes_special_chars,
         }
     }
 
@@ -177,6 +200,14 @@ impl FilenameCompleter {
     /// returns the start position and the completion candidates for the
     /// partial path to be completed.
     pub fn complete_path(&self, line: &str, pos: usize) -> Result<(usize, Vec<Pair>)> {
+        let (start, mut matches) = self.complete_path_unsorted(line, pos)?;
+        #[allow(clippy::unnecessary_sort_by)]
+        matches.sort_by(|a, b| a.display().cmp(b.display()));
+        Ok((start, matches))
+    }
+
+    /// Similar to [`Self::complete_path`], but the returned paths are unsorted.
+    pub fn complete_path_unsorted(&self, line: &str, pos: usize) -> Result<(usize, Vec<Pair>)> {
         let (start, path, esc_char, break_chars, quote) =
             if let Some((idx, quote)) = find_unclosed_quote(&line[..pos]) {
                 let start = idx + 1;
@@ -185,7 +216,7 @@ impl FilenameCompleter {
                         start,
                         unescape(&line[start..pos], DOUBLE_QUOTES_ESCAPE_CHAR),
                         DOUBLE_QUOTES_ESCAPE_CHAR,
-                        &self.double_quotes_special_chars,
+                        self.double_quotes_special_chars,
                         quote,
                     )
                 } else {
@@ -193,17 +224,16 @@ impl FilenameCompleter {
                         start,
                         Borrowed(&line[start..pos]),
                         None,
-                        &self.break_chars,
+                        self.break_chars,
                         quote,
                     )
                 }
             } else {
-                let (start, path) = extract_word(line, pos, ESCAPE_CHAR, &self.break_chars);
+                let (start, path) = extract_word(line, pos, ESCAPE_CHAR, self.break_chars);
                 let path = unescape(path, ESCAPE_CHAR);
-                (start, path, ESCAPE_CHAR, &self.break_chars, Quote::None)
+                (start, path, ESCAPE_CHAR, self.break_chars, Quote::None)
             };
-        let mut matches = filename_complete(&path, esc_char, break_chars, quote)?;
-        matches.sort_by(|a, b| a.display().cmp(b.display()));
+        let matches = filename_complete(&path, esc_char, break_chars, quote);
         Ok((start, matches))
     }
 }
@@ -223,6 +253,7 @@ impl Completer for FilenameCompleter {
 }
 
 /// Remove escape char
+#[must_use]
 pub fn unescape(input: &str, esc_char: Option<char>) -> Cow<'_, str> {
     let esc_char = if let Some(c) = esc_char {
         c
@@ -255,19 +286,17 @@ pub fn unescape(input: &str, esc_char: Option<char>) -> Cow<'_, str> {
 /// Escape any `break_chars` in `input` string with `esc_char`.
 /// For example, '/User Information' becomes '/User\ Information'
 /// when space is a breaking char and '\\' the escape char.
+#[must_use]
 pub fn escape(
     mut input: String,
     esc_char: Option<char>,
-    break_chars: &[u8],
+    is_break_char: fn(char) -> bool,
     quote: Quote,
 ) -> String {
     if quote == Quote::Single {
         return input; // no escape in single quotes
     }
-    let n = input
-        .bytes()
-        .filter(|b| memchr(*b, break_chars).is_some())
-        .count();
+    let n = input.chars().filter(|c| is_break_char(*c)).count();
     if n == 0 {
         return input; // no need to escape
     }
@@ -283,7 +312,7 @@ pub fn escape(
     let mut result = String::with_capacity(input.len() + n);
 
     for c in input.chars() {
-        if c.is_ascii() && memchr(c as u8, break_chars).is_some() {
+        if is_break_char(c) {
             result.push(esc_char);
         }
         result.push(c);
@@ -294,11 +323,11 @@ pub fn escape(
 fn filename_complete(
     path: &str,
     esc_char: Option<char>,
-    break_chars: &[u8],
+    is_break_char: fn(char) -> bool,
     quote: Quote,
-) -> Result<Vec<Pair>> {
+) -> Vec<Pair> {
     #[cfg(feature = "with-dirs")]
-    use dirs_next::home_dir;
+    use home::home_dir;
     use std::env::current_dir;
 
     let sep = path::MAIN_SEPARATOR;
@@ -340,39 +369,37 @@ fn filename_complete(
 
     // if dir doesn't exist, then don't offer any completions
     if !dir.exists() {
-        return Ok(entries);
+        return entries;
     }
 
     // if any of the below IO operations have errors, just ignore them
     if let Ok(read_dir) = dir.read_dir() {
         let file_name = normalize(file_name);
-        for entry in read_dir {
-            if let Ok(entry) = entry {
-                if let Some(s) = entry.file_name().to_str() {
-                    let ns = normalize(s);
-                    if ns.starts_with(file_name.as_ref()) {
-                        if let Ok(metadata) = fs::metadata(entry.path()) {
-                            let mut path = String::from(dir_name) + s;
-                            if metadata.is_dir() {
-                                path.push(sep);
-                            }
-                            entries.push(Pair {
-                                display: String::from(s),
-                                replacement: escape(path, esc_char, break_chars, quote),
-                            });
-                        } // else ignore PermissionDenied
-                    }
+        for entry in read_dir.flatten() {
+            if let Some(s) = entry.file_name().to_str() {
+                let ns = normalize(s);
+                if ns.starts_with(file_name.as_ref()) {
+                    if let Ok(metadata) = fs::metadata(entry.path()) {
+                        let mut path = String::from(dir_name) + s;
+                        if metadata.is_dir() {
+                            path.push(sep);
+                        }
+                        entries.push(Pair {
+                            display: String::from(s),
+                            replacement: escape(path, esc_char, is_break_char, quote),
+                        });
+                    } // else ignore PermissionDenied
                 }
             }
         }
     }
-    Ok(entries)
+    entries
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 fn normalize(s: &str) -> Cow<str> {
     // case insensitive
-    Cow::Owned(s.to_lowercase())
+    Owned(s.to_lowercase())
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -384,12 +411,13 @@ fn normalize(s: &str) -> Cow<str> {
 /// try to find backward the start of a word.
 /// Return (0, `line[..pos]`) if no break char has been found.
 /// Return the word and its start position (idx, `line[idx..pos]`) otherwise.
-pub fn extract_word<'l>(
-    line: &'l str,
+#[must_use]
+pub fn extract_word(
+    line: &str,
     pos: usize,
     esc_char: Option<char>,
-    break_chars: &[u8],
-) -> (usize, &'l str) {
+    is_break_char: fn(char) -> bool,
+) -> (usize, &str) {
     let line = &line[..pos];
     if line.is_empty() {
         return (0, line);
@@ -401,11 +429,10 @@ pub fn extract_word<'l>(
                 // escaped break char
                 start = None;
                 continue;
-            } else {
-                break;
             }
+            break;
         }
-        if c.is_ascii() && memchr(c as u8, break_chars).is_some() {
+        if is_break_char(c) {
             start = Some(i + c.len_utf8());
             if esc_char.is_none() {
                 break;
@@ -424,7 +451,7 @@ pub fn longest_common_prefix<C: Candidate>(candidates: &[C]) -> Option<&str> {
     if candidates.is_empty() {
         return None;
     } else if candidates.len() == 1 {
-        return Some(&candidates[0].replacement());
+        return Some(candidates[0].replacement());
     }
     let mut longest_common_prefix = 0;
     'o: loop {
@@ -450,7 +477,7 @@ pub fn longest_common_prefix<C: Candidate>(candidates: &[C]) -> Option<&str> {
     Some(&candidate[0..longest_common_prefix])
 }
 
-#[derive(PartialEq)]
+#[derive(Eq, PartialEq)]
 enum ScanMode {
     DoubleQuote,
     Escape,
@@ -512,16 +539,16 @@ fn find_unclosed_quote(s: &str) -> Option<(usize, Quote)> {
 mod tests {
     #[test]
     pub fn extract_word() {
-        let break_chars: &[u8] = &super::DEFAULT_BREAK_CHARS;
+        let break_chars = super::default_break_chars;
         let line = "ls '/usr/local/b";
         assert_eq!(
             (4, "/usr/local/b"),
-            super::extract_word(line, line.len(), Some('\\'), &break_chars)
+            super::extract_word(line, line.len(), Some('\\'), break_chars)
         );
         let line = "ls /User\\ Information";
         assert_eq!(
             (3, "/User\\ Information"),
-            super::extract_word(line, line.len(), Some('\\'), &break_chars)
+            super::extract_word(line, line.len(), Some('\\'), break_chars)
         );
     }
 
@@ -543,17 +570,17 @@ mod tests {
 
     #[test]
     pub fn escape() {
-        let break_chars: &[u8] = &super::DEFAULT_BREAK_CHARS;
+        let break_chars = super::default_break_chars;
         let input = String::from("/usr/local/b");
         assert_eq!(
             input.clone(),
-            super::escape(input, Some('\\'), &break_chars, super::Quote::None)
+            super::escape(input, Some('\\'), break_chars, super::Quote::None)
         );
         let input = String::from("/User Information");
         let result = String::from("/User\\ Information");
         assert_eq!(
             result,
-            super::escape(input, Some('\\'), &break_chars, super::Quote::None)
+            super::escape(input, Some('\\'), break_chars, super::Quote::None)
         );
     }
 

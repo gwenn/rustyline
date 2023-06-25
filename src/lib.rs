@@ -8,15 +8,20 @@
 //! Usage
 //!
 //! ```
-//! let mut rl = rustyline::Editor::<()>::new();
+//! let mut rl = rustyline::DefaultEditor::new()?;
 //! let readline = rl.readline(">> ");
 //! match readline {
 //!     Ok(line) => println!("Line: {:?}", line),
 //!     Err(_) => println!("No input"),
 //! }
+//! # Ok::<(), rustyline::error::ReadlineError>(())
 //! ```
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "custom-bindings")]
+mod binding;
+mod command;
 pub mod completion;
 pub mod config;
 mod edit;
@@ -30,40 +35,45 @@ mod kill_ring;
 mod layout;
 pub mod line_buffer;
 pub mod prompt;
+#[cfg(feature = "with-sqlite-history")]
+pub mod sqlite_history;
 mod tty;
 mod undo;
 pub mod validate;
 
-use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::result;
-use std::sync::{Arc, Mutex, RwLock};
 
 use log::debug;
+#[cfg(feature = "derive")]
+#[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
+pub use rustyline_derive::{Completer, Helper, Highlighter, Hinter, Validator};
 use unicode_width::UnicodeWidthStr;
 
-use crate::tty::{RawMode, Renderer, Term, Terminal};
+use crate::tty::{RawMode, RawReader, Renderer, Term, Terminal};
 
+#[cfg(feature = "custom-bindings")]
+pub use crate::binding::{ConditionalEventHandler, Event, EventContext, EventHandler};
 use crate::completion::{longest_common_prefix, Candidate, Completer};
-pub use crate::config::{
-    ColorMode, CompletionType, Config, EditMode, HistoryDuplicates, OutputStreamType,
-};
+pub use crate::config::{Behavior, ColorMode, CompletionType, Config, EditMode, HistoryDuplicates};
 use crate::edit::State;
+use crate::error::ReadlineError;
 use crate::highlight::Highlighter;
 use crate::hint::Hinter;
-use crate::history::{Direction, History};
-pub use crate::keymap::{Anchor, At, CharSearch, Cmd, Movement, RepeatCount, Word};
-use crate::keymap::{InputState, Refresher};
-pub use crate::keys::KeyPress;
-use crate::kill_ring::{KillRing, Mode};
-use crate::line_buffer::WordAction;
+use crate::history::{DefaultHistory, History, SearchDirection};
+pub use crate::keymap::{Anchor, At, CharSearch, Cmd, InputMode, Movement, RepeatCount, Word};
+use crate::keymap::{Bindings, InputState, Refresher};
+pub use crate::keys::{KeyCode, KeyEvent, Modifiers};
+use crate::kill_ring::KillRing;
+pub use crate::tty::ExternalPrinter;
+pub use crate::undo::Changeset;
 pub use crate::prompt::Prompt;
 use crate::validate::Validator;
 
 /// The error type for I/O and Linux Syscalls (Errno)
-pub type Result<T> = result::Result<T, error::ReadlineError>;
+pub type Result<T> = result::Result<T, ReadlineError>;
 
 /// Completes the line/word
 fn complete_line<H: Helper, P: Prompt + ?Sized>(
@@ -73,7 +83,9 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
     config: &Config,
 ) -> Result<Option<Cmd>> {
     #[cfg(all(unix, feature = "with-fuzzy"))]
-    use skim::{Skim, SkimOptionsBuilder};
+    use skim::prelude::{
+        unbounded, Skim, SkimItem, SkimItemReceiver, SkimItemSender, SkimOptionsBuilder,
+    };
 
     let completer = s.helper.unwrap();
     // get a list of completions
@@ -83,7 +95,7 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
         s.out.beep()?;
         Ok(None)
     } else if CompletionType::Circular == config.completion_type() {
-        let mark = s.changes.borrow_mut().begin();
+        let mark = s.changes.begin();
         // Save the current edited line before overwriting it
         let backup = s.line.as_str().to_owned();
         let backup_pos = s.line.pos();
@@ -99,15 +111,14 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
                 } else {
                     Borrowed(candidate)
                 };*/
-                completer.update(&mut s.line, start, candidate);
-                s.refresh_line()?;
+                completer.update(&mut s.line, start, candidate, &mut s.changes);
             } else {
                 // Restore current edited line
-                s.line.update(&backup, backup_pos);
-                s.refresh_line()?;
+                s.line.update(&backup, backup_pos, &mut s.changes);
             }
+            s.refresh_line()?;
 
-            cmd = s.next_cmd(input_state, rdr, true)?;
+            cmd = s.next_cmd(input_state, rdr, true, true)?;
             match cmd {
                 Cmd::Complete => {
                     i = (i + 1) % (candidates.len() + 1); // Circular
@@ -126,14 +137,14 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
                 Cmd::Abort => {
                     // Re-show original buffer
                     if i < candidates.len() {
-                        s.line.update(&backup, backup_pos);
+                        s.line.update(&backup, backup_pos, &mut s.changes);
                         s.refresh_line()?;
                     }
-                    s.changes.borrow_mut().truncate(mark);
+                    s.changes.truncate(mark);
                     return Ok(None);
                 }
                 _ => {
-                    s.changes.borrow_mut().end();
+                    s.changes.end();
                     break;
                 }
             }
@@ -143,7 +154,7 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
         if let Some(lcp) = longest_common_prefix(&candidates) {
             // if we can extend the item, extend it
             if lcp.len() > s.line.pos() - start {
-                completer.update(&mut s.line, start, lcp);
+                completer.update(&mut s.line, start, lcp, &mut s.changes);
                 s.refresh_line()?;
             }
         }
@@ -154,7 +165,7 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
             return Ok(None);
         }
         // we can't complete any further, wait for second tab
-        let mut cmd = s.next_cmd(input_state, rdr, true)?;
+        let mut cmd = s.next_cmd(input_state, rdr, true, true)?;
         // if any character other than tab, pass it to the main loop
         if cmd != Cmd::Complete {
             return Ok(Some(cmd));
@@ -166,7 +177,7 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
         // we got a second tab, maybe show list of possible completions
         let show_completions = if candidates.len() > config.completion_prompt_limit() {
             let msg = format!("\nDisplay all {} possibilities? (y or n)", candidates.len());
-            s.out.write_and_flush(msg.as_bytes())?;
+            s.out.write_and_flush(msg.as_str())?;
             s.layout.end.row += 1;
             while cmd != Cmd::SelfInsert(1, 'y')
                 && cmd != Cmd::SelfInsert(1, 'Y')
@@ -174,12 +185,9 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
                 && cmd != Cmd::SelfInsert(1, 'N')
                 && cmd != Cmd::Kill(Movement::BackwardChar(1))
             {
-                cmd = s.next_cmd(input_state, rdr, false)?;
+                cmd = s.next_cmd(input_state, rdr, false, true)?;
             }
-            match cmd {
-                Cmd::SelfInsert(1, 'y') | Cmd::SelfInsert(1, 'Y') => true,
-                _ => false,
-            }
+            matches!(cmd, Cmd::SelfInsert(1, 'y' | 'Y'))
         } else {
             true
         };
@@ -194,35 +202,59 @@ fn complete_line<H: Helper, P: Prompt + ?Sized>(
         // corresponding completion_type
         #[cfg(all(unix, feature = "with-fuzzy"))]
         {
+            use std::borrow::Cow;
             if CompletionType::Fuzzy == config.completion_type() {
-                // skim takes input of candidates separated by new line
-                let input = candidates
+                struct Candidate {
+                    index: usize,
+                    text: String,
+                }
+                impl SkimItem for Candidate {
+                    fn text(&self) -> Cow<str> {
+                        Cow::Borrowed(&self.text)
+                    }
+                }
+
+                let (tx_item, rx_item): (SkimItemSender, SkimItemReceiver) = unbounded();
+
+                candidates
                     .iter()
-                    .map(|c| c.display())
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                    .enumerate()
+                    .map(|(i, c)| Candidate {
+                        index: i,
+                        text: c.display().to_owned(),
+                    })
+                    .for_each(|c| {
+                        let _ = tx_item.send(std::sync::Arc::new(c));
+                    });
+                drop(tx_item); // so that skim could know when to stop waiting for more items.
 
                 // setup skim and run with input options
                 // will display UI for fuzzy search and return selected results
                 // by default skim multi select is off so only expect one selection
 
                 let options = SkimOptionsBuilder::default()
-                    .height(Some("20%"))
                     .prompt(Some("? "))
                     .reverse(true)
                     .build()
                     .unwrap();
 
-                let selected_items =
-                    Skim::run_with(&options, Some(Box::new(std::io::Cursor::new(input))))
-                        .map(|out| out.selected_items)
-                        .unwrap_or_else(Vec::new);
+                let selected_items = Skim::run_with(&options, Some(rx_item))
+                    .map(|out| out.selected_items)
+                    .unwrap_or_else(Vec::new);
 
                 // match the first (and only) returned option with the candidate and update the
                 // line otherwise only refresh line to clear the skim UI changes
                 if let Some(item) = selected_items.first() {
-                    if let Some(candidate) = candidates.get(item.get_index()) {
-                        completer.update(&mut s.line, start, candidate.replacement());
+                    let item: &Candidate = (*item).as_any() // cast to Any
+                        .downcast_ref::<Candidate>() // downcast to concrete type
+                        .expect("something wrong with downcast");
+                    if let Some(candidate) = candidates.get(item.index) {
+                        completer.update(
+                            &mut s.line,
+                            start,
+                            candidate.replacement(),
+                            &mut s.changes,
+                        );
                     }
                 }
                 s.refresh_line()?;
@@ -239,11 +271,14 @@ fn complete_hint_line<H: Helper, P: Prompt + ?Sized>(s: &mut State<'_, '_, H, P>
         None => return Ok(()),
     };
     s.line.move_end();
-    if s.line.yank(hint, 1).is_none() {
+    if let Some(text) = hint.completion() {
+        if s.line.yank(text, 1, &mut s.changes).is_none() {
+            s.out.beep()?;
+        }
+    } else {
         s.out.beep()?;
     }
-    s.refresh_line_with_msg(None)?;
-    Ok(())
+    s.refresh_line()
 }
 
 fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
@@ -272,7 +307,7 @@ fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
     let mut ab = String::new();
     for row in 0..num_rows {
         if row == pause_row {
-            s.out.write_and_flush(b"\n--More--")?;
+            s.out.write_and_flush("\n--More--")?;
             let mut cmd = Cmd::Noop;
             while cmd != Cmd::SelfInsert(1, 'y')
                 && cmd != Cmd::SelfInsert(1, 'Y')
@@ -283,23 +318,22 @@ fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
                 && cmd != Cmd::SelfInsert(1, ' ')
                 && cmd != Cmd::Kill(Movement::BackwardChar(1))
                 && cmd != Cmd::AcceptLine
-                && cmd != Cmd::AcceptOrInsertLine
+                && cmd != Cmd::Newline
+                && !matches!(cmd, Cmd::AcceptOrInsertLine { .. })
             {
-                cmd = s.next_cmd(input_state, rdr, false)?;
+                cmd = s.next_cmd(input_state, rdr, false, true)?;
             }
             match cmd {
-                Cmd::SelfInsert(1, 'y') | Cmd::SelfInsert(1, 'Y') | Cmd::SelfInsert(1, ' ') => {
+                Cmd::SelfInsert(1, 'y' | 'Y' | ' ') => {
                     pause_row += s.out.get_rows() - 1;
                 }
-                Cmd::AcceptLine | Cmd::AcceptOrInsertLine => {
+                Cmd::AcceptLine | Cmd::Newline | Cmd::AcceptOrInsertLine { .. } => {
                     pause_row += 1;
                 }
                 _ => break,
             }
-            s.out.write_and_flush(b"\n")?;
-        } else {
-            s.out.write_and_flush(b"\n")?;
         }
+        s.out.write_and_flush("\n")?;
         ab.clear();
         for col in 0..num_cols {
             let i = (col * num_rows) + row;
@@ -318,44 +352,46 @@ fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
                 }
             }
         }
-        s.out.write_and_flush(ab.as_bytes())?;
+        s.out.write_and_flush(ab.as_str())?;
     }
-    s.out.write_and_flush(b"\n")?;
+    s.out.write_and_flush("\n")?;
+    s.layout.end.row = 0; // dirty way to make clear_old_rows do nothing
+    s.layout.cursor.row = 0;
     s.refresh_line()?;
     Ok(None)
 }
 
 /// Incremental search
-fn reverse_incremental_search<H: Helper, P: Prompt + ?Sized>(
+fn reverse_incremental_search<H: Helper, I: History, P: Prompt + ?Sized>(
     rdr: &mut <Terminal as Term>::Reader,
     s: &mut State<'_, '_, H, P>,
     input_state: &mut InputState,
-    history: &History,
+    history: &I,
 ) -> Result<Option<Cmd>> {
     if history.is_empty() {
         return Ok(None);
     }
-    let mark = s.changes.borrow_mut().begin();
+    let mark = s.changes.begin();
     // Save the current edited line (and cursor position) before overwriting it
     let backup = s.line.as_str().to_owned();
     let backup_pos = s.line.pos();
 
     let mut search_buf = String::new();
     let mut history_idx = history.len() - 1;
-    let mut direction = Direction::Reverse;
+    let mut direction = SearchDirection::Reverse;
     let mut success = true;
 
     let mut cmd;
     // Display the reverse-i-search prompt and process chars
     loop {
         let prompt = if success {
-            format!("(reverse-i-search)`{}': ", search_buf)
+            format!("(reverse-i-search)`{search_buf}': ")
         } else {
-            format!("(failed reverse-i-search)`{}': ", search_buf)
+            format!("(failed reverse-i-search)`{search_buf}': ")
         };
         s.refresh_prompt_and_line(&prompt)?;
 
-        cmd = s.next_cmd(input_state, rdr, true)?;
+        cmd = s.next_cmd(input_state, rdr, true, true)?;
         if let Cmd::SelfInsert(_, c) = cmd {
             search_buf.push(c);
         } else {
@@ -365,7 +401,7 @@ fn reverse_incremental_search<H: Helper, P: Prompt + ?Sized>(
                     continue;
                 }
                 Cmd::ReverseSearchHistory => {
-                    direction = Direction::Reverse;
+                    direction = SearchDirection::Reverse;
                     if history_idx > 0 {
                         history_idx -= 1;
                     } else {
@@ -374,7 +410,7 @@ fn reverse_incremental_search<H: Helper, P: Prompt + ?Sized>(
                     }
                 }
                 Cmd::ForwardSearchHistory => {
-                    direction = Direction::Forward;
+                    direction = SearchDirection::Forward;
                     if history_idx < history.len() - 1 {
                         history_idx += 1;
                     } else {
@@ -384,9 +420,9 @@ fn reverse_incremental_search<H: Helper, P: Prompt + ?Sized>(
                 }
                 Cmd::Abort => {
                     // Restore current edited line (before search)
-                    s.line.update(&backup, backup_pos);
+                    s.line.update(&backup, backup_pos, &mut s.changes);
                     s.refresh_line()?;
-                    s.changes.borrow_mut().truncate(mark);
+                    s.changes.truncate(mark);
                     return Ok(None);
                 }
                 Cmd::Move(_) => {
@@ -396,285 +432,17 @@ fn reverse_incremental_search<H: Helper, P: Prompt + ?Sized>(
                 _ => break,
             }
         }
-        success = match history.search(&search_buf, history_idx, direction) {
-            Some(idx) => {
-                history_idx = idx;
-                let entry = history.get(idx).unwrap();
-                let pos = entry.find(&search_buf).unwrap();
-                s.line.update(entry, pos);
+        success = match history.search(&search_buf, history_idx, direction)? {
+            Some(sr) => {
+                history_idx = sr.idx;
+                s.line.update(&sr.entry, sr.pos, &mut s.changes);
                 true
             }
             _ => false,
         };
     }
-    s.changes.borrow_mut().end();
+    s.changes.end();
     Ok(Some(cmd))
-}
-
-/// Handles reading and editing the readline buffer.
-/// It will also handle special inputs in an appropriate fashion
-/// (e.g., C-c will exit readline)
-fn readline_edit<H: Helper, P: Prompt + ?Sized>(
-    prompt: &P,
-    initial: Option<(&str, &str)>,
-    editor: &mut Editor<H>,
-    original_mode: &tty::Mode,
-) -> Result<String> {
-    let helper = editor.helper.as_ref();
-
-    let mut stdout = editor.term.create_writer();
-
-    editor.reset_kill_ring(); // TODO recreate a new kill ring vs Arc<Mutex<KillRing>>
-    let ctx = Context::new(&editor.history);
-    let mut s = State::new(&mut stdout, prompt, helper, ctx);
-    let mut input_state = InputState::new(&editor.config, Arc::clone(&editor.custom_bindings));
-
-    s.line.set_delete_listener(editor.kill_ring.clone());
-    s.line.set_change_listener(s.changes.clone());
-
-    if let Some((left, right)) = initial {
-        s.line
-            .update((left.to_owned() + right).as_ref(), left.len());
-    }
-
-    let mut rdr = editor.term.create_reader(&editor.config)?;
-    if editor.term.is_output_tty() {
-        s.move_cursor_at_leftmost(&mut rdr)?;
-    }
-    s.refresh_line()?;
-
-    loop {
-        let rc = s.next_cmd(&mut input_state, &mut rdr, false);
-        let mut cmd = rc?;
-
-        if cmd.should_reset_kill_ring() {
-            editor.reset_kill_ring();
-        }
-
-        // autocomplete
-        if cmd == Cmd::Complete && s.helper.is_some() {
-            let next = complete_line(&mut rdr, &mut s, &mut input_state, &editor.config)?;
-            if let Some(next) = next {
-                cmd = next;
-            } else {
-                continue;
-            }
-        }
-
-        if Cmd::CompleteHint == cmd {
-            complete_hint_line(&mut s)?;
-            continue;
-        }
-
-        if let Cmd::SelfInsert(n, c) = cmd {
-            s.edit_insert(c, n)?;
-            continue;
-        } else if let Cmd::Insert(n, text) = cmd {
-            s.edit_yank(&input_state, &text, Anchor::Before, n)?;
-            continue;
-        }
-
-        if cmd == Cmd::ReverseSearchHistory {
-            // Search history backward
-            let next =
-                reverse_incremental_search(&mut rdr, &mut s, &mut input_state, &editor.history)?;
-            if let Some(next) = next {
-                cmd = next;
-            } else {
-                continue;
-            }
-        }
-
-        match cmd {
-            Cmd::Move(Movement::BeginningOfLine) => {
-                // Move to the beginning of line.
-                s.edit_move_home()?
-            }
-            Cmd::Move(Movement::ViFirstPrint) => {
-                s.edit_move_home()?;
-                s.edit_move_to_next_word(At::Start, Word::Big, 1)?
-            }
-            Cmd::Move(Movement::BackwardChar(n)) => {
-                // Move back a character.
-                s.edit_move_backward(n)?
-            }
-            Cmd::ReplaceChar(n, c) => s.edit_replace_char(c, n)?,
-            Cmd::Replace(mvt, text) => {
-                s.edit_kill(&mvt)?;
-                if let Some(text) = text {
-                    s.edit_insert_text(&text)?
-                }
-            }
-            Cmd::Overwrite(c) => {
-                s.edit_overwrite_char(c)?;
-            }
-            Cmd::EndOfFile => {
-                if !input_state.is_emacs_mode() && !s.line.is_empty() {
-                    s.edit_move_end()?;
-                    break;
-                } else if s.line.is_empty() {
-                    return Err(error::ReadlineError::Eof);
-                } else {
-                    s.edit_delete(1)?
-                }
-            }
-            Cmd::Move(Movement::EndOfLine) => {
-                // Move to the end of line.
-                s.edit_move_end()?
-            }
-            Cmd::Move(Movement::ForwardChar(n)) => {
-                // Move forward a character.
-                s.edit_move_forward(n)?
-            }
-            Cmd::ClearScreen => {
-                // Clear the screen leaving the current line at the top of the screen.
-                s.clear_screen()?;
-                s.refresh_line()?
-            }
-            Cmd::NextHistory => {
-                // Fetch the next command from the history list.
-                s.edit_history_next(false)?
-            }
-            Cmd::PreviousHistory => {
-                // Fetch the previous command from the history list.
-                s.edit_history_next(true)?
-            }
-            Cmd::LineUpOrPreviousHistory(n) => {
-                if !s.edit_move_line_up(n)? {
-                    s.edit_history_next(true)?
-                }
-            }
-            Cmd::LineDownOrNextHistory(n) => {
-                if !s.edit_move_line_down(n)? {
-                    s.edit_history_next(false)?
-                }
-            }
-            Cmd::HistorySearchBackward => s.edit_history_search(Direction::Reverse)?,
-            Cmd::HistorySearchForward => s.edit_history_search(Direction::Forward)?,
-            Cmd::TransposeChars => {
-                // Exchange the char before cursor with the character at cursor.
-                s.edit_transpose_chars()?
-            }
-            #[cfg(unix)]
-            Cmd::QuotedInsert => {
-                // Quoted insert
-                use tty::RawReader;
-                let c = rdr.next_char()?;
-                s.edit_insert(c, 1)?
-            }
-            Cmd::Yank(n, anchor) => {
-                // retrieve (yank) last item killed
-                let mut kill_ring = editor.kill_ring.lock().unwrap();
-                if let Some(text) = kill_ring.yank() {
-                    s.edit_yank(&input_state, text, anchor, n)?
-                }
-            }
-            Cmd::ViYankTo(ref mvt) => {
-                if let Some(text) = s.line.copy(mvt) {
-                    let mut kill_ring = editor.kill_ring.lock().unwrap();
-                    kill_ring.kill(&text, Mode::Append)
-                }
-            }
-            Cmd::AcceptLine | Cmd::AcceptOrInsertLine => {
-                #[cfg(test)]
-                {
-                    editor.term.cursor = s.layout.cursor.col;
-                }
-                if s.has_hint() || !s.is_default_prompt() {
-                    // Force a refresh without hints to leave the previous
-                    // line as the user typed it after a newline.
-                    s.refresh_line_with_msg(None)?;
-                }
-                // Only accept value if cursor is at the end of the buffer
-                if s.validate()? && (cmd == Cmd::AcceptLine || s.line.is_end_of_input()) {
-                    break;
-                } else {
-                    s.edit_insert('\n', 1)?;
-                }
-                continue;
-            }
-            Cmd::BeginningOfHistory => {
-                // move to first entry in history
-                s.edit_history(true)?
-            }
-            Cmd::EndOfHistory => {
-                // move to last entry in history
-                s.edit_history(false)?
-            }
-            Cmd::Move(Movement::BackwardWord(n, word_def)) => {
-                // move backwards one word
-                s.edit_move_to_prev_word(word_def, n)?
-            }
-            Cmd::CapitalizeWord => {
-                // capitalize word after point
-                s.edit_word(WordAction::CAPITALIZE)?
-            }
-            Cmd::Kill(ref mvt) => {
-                s.edit_kill(mvt)?;
-            }
-            Cmd::Move(Movement::ForwardWord(n, at, word_def)) => {
-                // move forwards one word
-                s.edit_move_to_next_word(at, word_def, n)?
-            }
-            Cmd::Move(Movement::LineUp(n)) => {
-                s.edit_move_line_up(n)?;
-            }
-            Cmd::Move(Movement::LineDown(n)) => {
-                s.edit_move_line_down(n)?;
-            }
-            Cmd::Move(Movement::BeginningOfBuffer) => {
-                // Move to the start of the buffer.
-                s.edit_move_buffer_start()?
-            }
-            Cmd::Move(Movement::EndOfBuffer) => {
-                // Move to the end of the buffer.
-                s.edit_move_buffer_end()?
-            }
-            Cmd::DowncaseWord => {
-                // lowercase word after point
-                s.edit_word(WordAction::LOWERCASE)?
-            }
-            Cmd::TransposeWords(n) => {
-                // transpose words
-                s.edit_transpose_words(n)?
-            }
-            Cmd::UpcaseWord => {
-                // uppercase word after point
-                s.edit_word(WordAction::UPPERCASE)?
-            }
-            Cmd::YankPop => {
-                // yank-pop
-                let mut kill_ring = editor.kill_ring.lock().unwrap();
-                if let Some((yank_size, text)) = kill_ring.yank_pop() {
-                    s.edit_yank_pop(yank_size, text)?
-                }
-            }
-            Cmd::Move(Movement::ViCharSearch(n, cs)) => s.edit_move_to(cs, n)?,
-            Cmd::Undo(n) => {
-                if s.changes.borrow_mut().undo(&mut s.line, n) {
-                    s.refresh_line()?;
-                }
-            }
-            Cmd::Interrupt => {
-                return Err(error::ReadlineError::Interrupted);
-            }
-            #[cfg(unix)]
-            Cmd::Suspend => {
-                original_mode.disable_raw_mode()?;
-                tty::suspend()?;
-                editor.term.enable_raw_mode()?; // TODO original_mode may have changed
-                s.refresh_line()?;
-                continue;
-            }
-            _ => {
-                // Ignore the character typed.
-            }
-        }
-    }
-    if cfg!(windows) {
-        let _ = original_mode; // silent warning
-    }
-    Ok(s.line.into_string())
 }
 
 struct Guard<'m>(&'m tty::Mode);
@@ -687,35 +455,89 @@ impl Drop for Guard<'_> {
     }
 }
 
-/// Readline method that will enable RAW mode, call the `readline_edit()`
-/// method and disable raw mode
-fn readline_raw<H: Helper, P: Prompt + ?Sized>(
-    prompt: &P,
-    initial: Option<(&str, &str)>,
-    editor: &mut Editor<H>,
-) -> Result<String> {
-    let original_mode = editor.term.enable_raw_mode()?;
-    let guard = Guard(&original_mode);
-    let user_input = readline_edit(prompt, initial, editor, &original_mode);
-    if editor.config.auto_add_history() {
-        if let Ok(ref line) = user_input {
-            editor.add_history_entry(line.as_str());
+// Helper to handle backspace characters in a direct input
+fn apply_backspace_direct(input: &str) -> String {
+    // Setup the output buffer
+    // No '\b' in the input in the common case, so set the capacity to the input
+    // length
+    let mut out = String::with_capacity(input.len());
+
+    // Keep track of the size of each grapheme from the input
+    // As many graphemes as input bytes in the common case
+    let mut grapheme_sizes: Vec<u8> = Vec::with_capacity(input.len());
+
+    for g in unicode_segmentation::UnicodeSegmentation::graphemes(input, true) {
+        if g == "\u{0008}" {
+            // backspace char
+            if let Some(n) = grapheme_sizes.pop() {
+                // Remove the last grapheme
+                out.truncate(out.len() - n as usize);
+            }
+        } else {
+            out.push_str(g);
+            grapheme_sizes.push(g.len() as u8);
         }
     }
-    drop(guard); // disable_raw_mode(original_mode)?;
-    match editor.config.output_stream() {
-        OutputStreamType::Stdout => writeln!(io::stdout())?,
-        OutputStreamType::Stderr => writeln!(io::stderr())?,
-    };
-    user_input
+
+    out
 }
 
-fn readline_direct() -> Result<String> {
-    let mut line = String::new();
-    if io::stdin().read_line(&mut line)? > 0 {
-        Ok(line)
-    } else {
-        Err(error::ReadlineError::Eof)
+fn readline_direct(
+    mut reader: impl BufRead,
+    mut writer: impl Write,
+    validator: &Option<impl Validator>,
+) -> Result<String> {
+    let mut input = String::new();
+
+    loop {
+        if reader.read_line(&mut input)? == 0 {
+            return Err(ReadlineError::Eof);
+        }
+        // Remove trailing newline
+        let trailing_n = input.ends_with('\n');
+        let trailing_r;
+
+        if trailing_n {
+            input.pop();
+            trailing_r = input.ends_with('\r');
+            if trailing_r {
+                input.pop();
+            }
+        } else {
+            trailing_r = false;
+        }
+
+        input = apply_backspace_direct(&input);
+
+        match validator.as_ref() {
+            None => return Ok(input),
+            Some(v) => {
+                let mut ctx = input.as_str();
+                let mut ctx = validate::ValidationContext::new(&mut ctx);
+
+                match v.validate(&mut ctx)? {
+                    validate::ValidationResult::Valid(msg) => {
+                        if let Some(msg) = msg {
+                            writer.write_all(msg.as_bytes())?;
+                        }
+                        return Ok(input);
+                    }
+                    validate::ValidationResult::Invalid(Some(msg)) => {
+                        writer.write_all(msg.as_bytes())?;
+                    }
+                    validate::ValidationResult::Incomplete => {
+                        // Add newline and keep on taking input
+                        if trailing_r {
+                            input.push('\r');
+                        }
+                        if trailing_n {
+                            input.push('\n');
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -735,13 +557,14 @@ impl<'h, H: ?Sized + Helper> Helper for &'h H {}
 
 /// Completion/suggestion context
 pub struct Context<'h> {
-    history: &'h History,
+    history: &'h dyn History,
     history_index: usize,
 }
 
 impl<'h> Context<'h> {
     /// Constructor. Visible for testing.
-    pub fn new(history: &'h History) -> Self {
+    #[must_use]
+    pub fn new(history: &'h dyn History) -> Self {
         Context {
             history,
             history_index: history.len(),
@@ -749,49 +572,63 @@ impl<'h> Context<'h> {
     }
 
     /// Return an immutable reference to the history object.
-    pub fn history(&self) -> &History {
-        &self.history
+    #[must_use]
+    pub fn history(&self) -> &dyn History {
+        self.history
     }
 
     /// The history index we are currently editing
+    #[must_use]
     pub fn history_index(&self) -> usize {
         self.history_index
     }
 }
 
 /// Line editor
-pub struct Editor<H: Helper> {
+#[must_use]
+pub struct Editor<H: Helper, I: History> {
     term: Terminal,
-    history: History,
+    history: I,
     helper: Option<H>,
-    kill_ring: Arc<Mutex<KillRing>>,
+    kill_ring: KillRing,
     config: Config,
-    custom_bindings: Arc<RwLock<HashMap<KeyPress, Cmd>>>,
+    custom_bindings: Bindings,
 }
 
+/// Default editor with no helper and `DefaultHistory`
+pub type DefaultEditor = Editor<(), DefaultHistory>;
+
 #[allow(clippy::new_without_default)]
-impl<H: Helper> Editor<H> {
+impl<H: Helper> Editor<H, DefaultHistory> {
     /// Create an editor with the default configuration
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         Self::with_config(Config::default())
     }
 
     /// Create an editor with a specific configuration.
-    pub fn with_config(config: Config) -> Self {
+    pub fn with_config(config: Config) -> Result<Self> {
+        Self::with_history(config, DefaultHistory::with_config(config))
+    }
+}
+
+impl<H: Helper, I: History> Editor<H, I> {
+    /// Create an editor with a custom history impl.
+    pub fn with_history(config: Config, history: I) -> Result<Self> {
         let term = Terminal::new(
             config.color_mode(),
-            config.output_stream(),
+            config.behavior(),
             config.tab_stop(),
             config.bell_style(),
-        );
-        Self {
+            config.enable_bracketed_paste(),
+        )?;
+        Ok(Self {
             term,
-            history: History::with_config(config),
+            history,
             helper: None,
-            kill_ring: Arc::new(Mutex::new(KillRing::new(60))),
+            kill_ring: KillRing::new(60),
             config,
-            custom_bindings: Arc::new(RwLock::new(HashMap::new())),
-        }
+            custom_bindings: Bindings::new(),
+        })
     }
 
     /// This method will read a line from STDIN and will display a `prompt`.
@@ -827,43 +664,175 @@ impl<H: Helper> Editor<H> {
             stdout.write_all(prompt.get_prompt(&()).as_bytes())?;
             stdout.flush()?;
 
-            readline_direct()
-        } else if self.term.is_stdin_tty() {
-            readline_raw(prompt, initial, self)
+            readline_direct(io::stdin().lock(), io::stderr(), &self.helper)
+        } else if self.term.is_input_tty() {
+            let (original_mode, term_key_map) = self.term.enable_raw_mode()?;
+            let guard = Guard(&original_mode);
+            let user_input = self.readline_edit(prompt, initial, &original_mode, term_key_map);
+            if self.config.auto_add_history() {
+                if let Ok(ref line) = user_input {
+                    self.add_history_entry(line.as_str())?;
+                }
+            }
+            drop(guard); // disable_raw_mode(original_mode)?;
+            self.term.writeln()?;
+            user_input
         } else {
             debug!(target: "rustyline", "stdin is not a tty");
             // Not a tty: read from file / pipe.
-            readline_direct()
+            readline_direct(io::stdin().lock(), io::stderr(), &self.helper)
         }
+    }
+
+    /// Handles reading and editing the readline buffer.
+    /// It will also handle special inputs in an appropriate fashion
+    /// (e.g., C-c will exit readline)
+    fn readline_edit<P: Prompt + ?Sized>(
+        &mut self,
+        prompt: &P,
+        initial: Option<(&str, &str)>,
+        original_mode: &tty::Mode,
+        term_key_map: tty::KeyMap,
+    ) -> Result<String> {
+        let mut stdout = self.term.create_writer();
+
+        self.kill_ring.reset(); // TODO recreate a new kill ring vs reset
+        let ctx = Context::new(&self.history);
+        let mut s = State::new(&mut stdout, prompt, self.helper.as_ref(), ctx);
+
+        let mut input_state = InputState::new(&self.config, &self.custom_bindings);
+
+        if let Some((left, right)) = initial {
+            s.line.update(
+                (left.to_owned() + right).as_ref(),
+                left.len(),
+                &mut s.changes,
+            );
+        }
+
+        let mut rdr = self.term.create_reader(&self.config, term_key_map);
+        if self.term.is_output_tty() && self.config.check_cursor_position() {
+            if let Err(e) = s.move_cursor_at_leftmost(&mut rdr) {
+                if let ReadlineError::WindowResized = e {
+                    s.out.update_size();
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+        s.refresh_line()?;
+
+        loop {
+            let mut cmd = s.next_cmd(&mut input_state, &mut rdr, false, false)?;
+
+            if cmd.should_reset_kill_ring() {
+                self.kill_ring.reset();
+            }
+
+            // First trigger commands that need extra input
+
+            if cmd == Cmd::Complete && s.helper.is_some() {
+                let next = complete_line(&mut rdr, &mut s, &mut input_state, &self.config)?;
+                if let Some(next) = next {
+                    cmd = next;
+                } else {
+                    continue;
+                }
+            }
+
+            if cmd == Cmd::ReverseSearchHistory {
+                // Search history backward
+                let next =
+                    reverse_incremental_search(&mut rdr, &mut s, &mut input_state, &self.history)?;
+                if let Some(next) = next {
+                    cmd = next;
+                } else {
+                    continue;
+                }
+            }
+
+            #[cfg(unix)]
+            if cmd == Cmd::Suspend {
+                original_mode.disable_raw_mode()?;
+                tty::suspend()?;
+                let _ = self.term.enable_raw_mode()?; // TODO original_mode may have changed
+                s.out.update_size(); // window may have been resized
+                s.refresh_line()?;
+                continue;
+            }
+
+            #[cfg(unix)]
+            if cmd == Cmd::QuotedInsert {
+                // Quoted insert
+                let c = rdr.next_char()?;
+                s.edit_insert(c, 1)?;
+                continue;
+            }
+
+            #[cfg(windows)]
+            if cmd == Cmd::PasteFromClipboard {
+                let clipboard = rdr.read_pasted_text()?;
+                s.edit_yank(&input_state, &clipboard[..], Anchor::Before, 1)?;
+            }
+
+            // Tiny test quirk
+            #[cfg(test)]
+            if matches!(
+                cmd,
+                Cmd::AcceptLine | Cmd::Newline | Cmd::AcceptOrInsertLine { .. }
+            ) {
+                self.term.cursor = s.layout.cursor.col;
+            }
+
+            // Execute things can be done solely on a state object
+            match command::execute(cmd, &mut s, &input_state, &mut self.kill_ring, &self.config)? {
+                command::Status::Proceed => continue,
+                command::Status::Submit => break,
+            }
+        }
+
+        // Move to end, in case cursor was in the middle of the line, so that
+        // next thing application prints goes after the input
+        s.edit_move_buffer_end()?;
+
+        if cfg!(windows) {
+            let _ = original_mode; // silent warning
+        }
+        Ok(s.line.into_string())
     }
 
     /// Load the history from the specified file.
     pub fn load_history<P: AsRef<Path> + ?Sized>(&mut self, path: &P) -> Result<()> {
-        self.history.load(path)
+        self.history.load(path.as_ref())
     }
 
     /// Save the history in the specified file.
-    pub fn save_history<P: AsRef<Path> + ?Sized>(&self, path: &P) -> Result<()> {
-        self.history.save(path)
+    pub fn save_history<P: AsRef<Path> + ?Sized>(&mut self, path: &P) -> Result<()> {
+        self.history.save(path.as_ref())
+    }
+
+    /// Append new entries in the specified file.
+    pub fn append_history<P: AsRef<Path> + ?Sized>(&mut self, path: &P) -> Result<()> {
+        self.history.append(path.as_ref())
     }
 
     /// Add a new entry in the history.
-    pub fn add_history_entry<S: AsRef<str> + Into<String>>(&mut self, line: S) -> bool {
-        self.history.add(line)
+    pub fn add_history_entry<S: AsRef<str> + Into<String>>(&mut self, line: S) -> Result<bool> {
+        self.history.add(line.as_ref())
     }
 
     /// Clear history.
-    pub fn clear_history(&mut self) {
+    pub fn clear_history(&mut self) -> Result<()> {
         self.history.clear()
     }
 
     /// Return a mutable reference to the history object.
-    pub fn history_mut(&mut self) -> &mut History {
+    pub fn history_mut(&mut self) -> &mut I {
         &mut self.history
     }
 
     /// Return an immutable reference to the history object.
-    pub fn history(&self) -> &History {
+    pub fn history(&self) -> &I {
         &self.history
     }
 
@@ -884,26 +853,29 @@ impl<H: Helper> Editor<H> {
     }
 
     /// Bind a sequence to a command.
-    pub fn bind_sequence(&mut self, key_seq: KeyPress, cmd: Cmd) -> Option<Cmd> {
-        if let Ok(mut bindings) = self.custom_bindings.write() {
-            bindings.insert(key_seq, cmd)
-        } else {
-            None
-        }
+    #[cfg(feature = "custom-bindings")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "custom-bindings")))]
+    pub fn bind_sequence<E: Into<Event>, R: Into<EventHandler>>(
+        &mut self,
+        key_seq: E,
+        handler: R,
+    ) -> Option<EventHandler> {
+        self.custom_bindings
+            .insert(Event::normalize(key_seq.into()), handler.into())
     }
 
     /// Remove a binding for the given sequence.
-    pub fn unbind_sequence(&mut self, key_seq: KeyPress) -> Option<Cmd> {
-        if let Ok(mut bindings) = self.custom_bindings.write() {
-            bindings.remove(&key_seq)
-        } else {
-            None
-        }
+    #[cfg(feature = "custom-bindings")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "custom-bindings")))]
+    pub fn unbind_sequence<E: Into<Event>>(&mut self, key_seq: E) -> Option<EventHandler> {
+        self.custom_bindings
+            .remove(&Event::normalize(key_seq.into()))
     }
 
-    /// Returns an iterator over edited lines
+    /// Returns an iterator over edited lines.
+    /// Iterator ends at [EOF](ReadlineError::Eof).
     /// ```
-    /// let mut rl = rustyline::Editor::<()>::new();
+    /// let mut rl = rustyline::DefaultEditor::new()?;
     /// for readline in rl.iter("> ") {
     ///     match readline {
     ///         Ok(line) => {
@@ -915,17 +887,13 @@ impl<H: Helper> Editor<H> {
     ///         }
     ///     }
     /// }
+    /// # Ok::<(), rustyline::error::ReadlineError>(())
     /// ```
     pub fn iter<'a>(&'a mut self, prompt: &'a str) -> impl Iterator<Item = Result<String>> + 'a {
         Iter {
             editor: self,
             prompt,
         }
-    }
-
-    fn reset_kill_ring(&self) {
-        let mut kill_ring = self.kill_ring.lock().unwrap();
-        kill_ring.reset();
     }
 
     /// If output stream is a tty, this function returns its width and height as
@@ -938,26 +906,41 @@ impl<H: Helper> Editor<H> {
             None
         }
     }
+
+    /// Clear the screen.
+    pub fn clear_screen(&mut self) -> Result<()> {
+        if self.term.is_output_tty() {
+            let mut out = self.term.create_writer();
+            out.clear_screen()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Create an external printer
+    pub fn create_external_printer(&mut self) -> Result<<Terminal as Term>::ExternalPrinter> {
+        self.term.create_external_printer()
+    }
 }
 
-impl<H: Helper> config::Configurer for Editor<H> {
+impl<H: Helper, I: History> config::Configurer for Editor<H, I> {
     fn config_mut(&mut self) -> &mut Config {
         &mut self.config
     }
 
-    fn set_max_history_size(&mut self, max_size: usize) {
+    fn set_max_history_size(&mut self, max_size: usize) -> Result<()> {
         self.config_mut().set_max_history_size(max_size);
-        self.history.set_max_len(max_size);
+        self.history.set_max_len(max_size)
     }
 
-    fn set_history_ignore_dups(&mut self, yes: bool) {
+    fn set_history_ignore_dups(&mut self, yes: bool) -> Result<()> {
         self.config_mut().set_history_ignore_dups(yes);
-        self.history.ignore_dups = yes;
+        self.history.ignore_dups(yes)
     }
 
     fn set_history_ignore_space(&mut self, yes: bool) {
         self.config_mut().set_history_ignore_space(yes);
-        self.history.ignore_space = yes;
+        self.history.ignore_space(yes);
     }
 
     fn set_color_mode(&mut self, color_mode: ColorMode) {
@@ -966,7 +949,7 @@ impl<H: Helper> config::Configurer for Editor<H> {
     }
 }
 
-impl<H: Helper> fmt::Debug for Editor<H> {
+impl<H: Helper, I: History> fmt::Debug for Editor<H, I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Editor")
             .field("term", &self.term)
@@ -975,19 +958,19 @@ impl<H: Helper> fmt::Debug for Editor<H> {
     }
 }
 
-struct Iter<'a, H: Helper> {
-    editor: &'a mut Editor<H>,
+struct Iter<'a, H: Helper, I: History> {
+    editor: &'a mut Editor<H, I>,
     prompt: &'a str,
 }
 
-impl<'a, H: Helper> Iterator for Iter<'a, H> {
+impl<'a, H: Helper, I: History> Iterator for Iter<'a, H, I> {
     type Item = Result<String>;
 
     fn next(&mut self) -> Option<Result<String>> {
         let readline = self.editor.readline(self.prompt);
         match readline {
             Ok(l) => Some(Ok(l)),
-            Err(error::ReadlineError::Eof) => None,
+            Err(ReadlineError::Eof) => None,
             e @ Err(_) => Some(e),
         }
     }

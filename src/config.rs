@@ -1,4 +1,5 @@
 //! Customize line editor
+use crate::Result;
 use std::default::Default;
 
 /// User preferences
@@ -24,19 +25,27 @@ pub struct Config {
     bell_style: BellStyle,
     /// if colors should be enabled.
     color_mode: ColorMode,
-    /// Whether to use stdout or stderr
-    output_stream: OutputStreamType,
+    /// Whether to use stdio or not
+    behavior: Behavior,
     /// Horizontal space taken by a tab.
     tab_stop: usize,
+    /// Indentation size for indent/dedent commands
+    indent_size: usize,
+    /// Check if cursor position is at leftmost before displaying prompt
+    check_cursor_position: bool,
+    /// Bracketed paste on unix platform
+    enable_bracketed_paste: bool,
 }
 
 impl Config {
     /// Returns a `Config` builder.
+    #[must_use]
     pub fn builder() -> Builder {
         Builder::new()
     }
 
     /// Tell the maximum length (i.e. number of entries) for the history.
+    #[must_use]
     pub fn max_history_size(&self) -> usize {
         self.max_history_size
     }
@@ -49,6 +58,7 @@ impl Config {
     /// in the history list.
     ///
     /// By default, they are ignored.
+    #[must_use]
     pub fn history_duplicates(&self) -> HistoryDuplicates {
         self.history_duplicates
     }
@@ -65,6 +75,7 @@ impl Config {
     /// the history list.
     ///
     /// By default, they are saved.
+    #[must_use]
     pub fn history_ignore_space(&self) -> bool {
         self.history_ignore_space
     }
@@ -76,6 +87,7 @@ impl Config {
     /// Completion behaviour.
     ///
     /// By default, `CompletionType::Circular`.
+    #[must_use]
     pub fn completion_type(&self) -> CompletionType {
         self.completion_type
     }
@@ -83,6 +95,7 @@ impl Config {
     /// When listing completion alternatives, only display
     /// one screen of possibilities at a time (used for `CompletionType::List`
     /// mode).
+    #[must_use]
     pub fn completion_prompt_limit(&self) -> usize {
         self.completion_prompt_limit
     }
@@ -92,11 +105,13 @@ impl Config {
     /// platform).
     ///
     /// By default, no timeout (-1) or 500ms if `EditMode::Vi` is activated.
+    #[must_use]
     pub fn keyseq_timeout(&self) -> i32 {
         self.keyseq_timeout
     }
 
     /// Emacs or Vi mode
+    #[must_use]
     pub fn edit_mode(&self) -> EditMode {
         self.edit_mode
     }
@@ -104,11 +119,13 @@ impl Config {
     /// Tell if lines are automatically added to the history.
     ///
     /// By default, they are not.
+    #[must_use]
     pub fn auto_add_history(&self) -> bool {
         self.auto_add_history
     }
 
     /// Bell style: beep, flash or nothing.
+    #[must_use]
     pub fn bell_style(&self) -> BellStyle {
         self.bell_style
     }
@@ -116,6 +133,7 @@ impl Config {
     /// Tell if colors should be enabled.
     ///
     /// By default, they are except if stdout is not a TTY.
+    #[must_use]
     pub fn color_mode(&self) -> ColorMode {
         self.color_mode
     }
@@ -124,26 +142,56 @@ impl Config {
         self.color_mode = color_mode;
     }
 
-    /// Tell which output stream should be used: stdout or stderr.
+    /// Whether to use stdio or not
     ///
-    /// By default, stdout is used.
-    pub fn output_stream(&self) -> OutputStreamType {
-        self.output_stream
+    /// By default, stdio is used.
+    #[must_use]
+    pub fn behavior(&self) -> Behavior {
+        self.behavior
     }
 
-    pub(crate) fn set_output_stream(&mut self, stream: OutputStreamType) {
-        self.output_stream = stream;
+    pub(crate) fn set_behavior(&mut self, behavior: Behavior) {
+        self.behavior = behavior;
     }
 
     /// Horizontal space taken by a tab.
     ///
     /// By default, 8.
+    #[must_use]
     pub fn tab_stop(&self) -> usize {
         self.tab_stop
     }
 
     pub(crate) fn set_tab_stop(&mut self, tab_stop: usize) {
         self.tab_stop = tab_stop;
+    }
+
+    /// Check if cursor position is at leftmost before displaying prompt.
+    ///
+    /// By default, we don't check.
+    #[must_use]
+    pub fn check_cursor_position(&self) -> bool {
+        self.check_cursor_position
+    }
+
+    /// Indentation size used by indentation commands
+    ///
+    /// By default, 2.
+    #[must_use]
+    pub fn indent_size(&self) -> usize {
+        self.indent_size
+    }
+
+    pub(crate) fn set_indent_size(&mut self, indent_size: usize) {
+        self.indent_size = indent_size;
+    }
+
+    /// Bracketed paste on unix platform
+    ///
+    /// By default, it's enabled.
+    #[must_use]
+    pub fn enable_bracketed_paste(&self) -> bool {
+        self.enable_bracketed_paste
     }
 }
 
@@ -160,8 +208,11 @@ impl Default for Config {
             auto_add_history: false,
             bell_style: BellStyle::default(),
             color_mode: ColorMode::Enabled,
-            output_stream: OutputStreamType::Stdout,
+            behavior: Behavior::default(),
             tab_stop: 8,
+            indent_size: 2,
+            check_cursor_position: false,
+            enable_bracketed_paste: true,
         }
     }
 }
@@ -177,7 +228,7 @@ pub enum BellStyle {
     Visible,
 }
 
-/// `Audible` by default on unix (overriden by current Terminal settings).
+/// `Audible` by default on unix (overridden by current Terminal settings).
 /// `None` on windows.
 impl Default for BellStyle {
     #[cfg(any(windows, target_arch = "wasm32"))]
@@ -241,15 +292,19 @@ pub enum ColorMode {
     Disabled,
 }
 
-/// Should the editor use stdout or stderr
-// TODO console term::TermTarget
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Should the editor use stdio
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum OutputStreamType {
-    /// Use stderr
-    Stderr,
-    /// Use stdout
-    Stdout,
+pub enum Behavior {
+    /// Use stdin / stdout
+    #[default]
+    Stdio,
+    /// Use terminal-style interaction whenever possible, even if 'stdin' and/or
+    /// 'stdout' are not terminals.
+    PreferTerm,
+    // TODO
+    // Use file-style interaction, reading input from the given file.
+    // useFile
 }
 
 /// Configuration builder
@@ -260,6 +315,7 @@ pub struct Builder {
 
 impl Builder {
     /// Returns a `Config` builder.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             p: Config::default(),
@@ -267,30 +323,32 @@ impl Builder {
     }
 
     /// Set the maximum length for the history.
-    pub fn max_history_size(mut self, max_size: usize) -> Self {
-        self.set_max_history_size(max_size);
-        self
+    pub fn max_history_size(mut self, max_size: usize) -> Result<Self> {
+        self.set_max_history_size(max_size)?;
+        Ok(self)
     }
 
     /// Tell if lines which match the previous history entry are saved or not
     /// in the history list.
     ///
     /// By default, they are ignored.
-    pub fn history_ignore_dups(mut self, yes: bool) -> Self {
-        self.set_history_ignore_dups(yes);
-        self
+    pub fn history_ignore_dups(mut self, yes: bool) -> Result<Self> {
+        self.set_history_ignore_dups(yes)?;
+        Ok(self)
     }
 
     /// Tell if lines which begin with a space character are saved or not in
     /// the history list.
     ///
     /// By default, they are saved.
+    #[must_use]
     pub fn history_ignore_space(mut self, yes: bool) -> Self {
         self.set_history_ignore_space(yes);
         self
     }
 
     /// Set `completion_type`.
+    #[must_use]
     pub fn completion_type(mut self, completion_type: CompletionType) -> Self {
         self.set_completion_type(completion_type);
         self
@@ -298,6 +356,7 @@ impl Builder {
 
     /// The number of possible completions that determines when the user is
     /// asked whether the list of possibilities should be displayed.
+    #[must_use]
     pub fn completion_prompt_limit(mut self, completion_prompt_limit: usize) -> Self {
         self.set_completion_prompt_limit(completion_prompt_limit);
         self
@@ -308,12 +367,14 @@ impl Builder {
     /// sequence.
     /// After seeing an ESC key, wait at most `keyseq_timeout_ms` for another
     /// byte.
+    #[must_use]
     pub fn keyseq_timeout(mut self, keyseq_timeout_ms: i32) -> Self {
         self.set_keyseq_timeout(keyseq_timeout_ms);
         self
     }
 
     /// Choose between Emacs or Vi mode.
+    #[must_use]
     pub fn edit_mode(mut self, edit_mode: EditMode) -> Self {
         self.set_edit_mode(edit_mode);
         self
@@ -322,12 +383,14 @@ impl Builder {
     /// Tell if lines are automatically added to the history.
     ///
     /// By default, they are not.
+    #[must_use]
     pub fn auto_add_history(mut self, yes: bool) -> Self {
         self.set_auto_add_history(yes);
         self
     }
 
     /// Set bell style: beep, flash or nothing.
+    #[must_use]
     pub fn bell_style(mut self, bell_style: BellStyle) -> Self {
         self.set_bell_style(bell_style);
         self
@@ -336,28 +399,59 @@ impl Builder {
     /// Forces colorization on or off.
     ///
     /// By default, colorization is on except if stdout is not a TTY.
+    #[must_use]
     pub fn color_mode(mut self, color_mode: ColorMode) -> Self {
         self.set_color_mode(color_mode);
         self
     }
 
-    /// Whether to use stdout or stderr.
+    /// Whether to use stdio or not
     ///
-    /// Be default, use stdout
-    pub fn output_stream(mut self, stream: OutputStreamType) -> Self {
-        self.set_output_stream(stream);
+    /// By default, stdio is used.
+    #[must_use]
+    pub fn behavior(mut self, behavior: Behavior) -> Self {
+        self.set_behavior(behavior);
         self
     }
 
     /// Horizontal space taken by a tab.
     ///
     /// By default, `8`
+    #[must_use]
     pub fn tab_stop(mut self, tab_stop: usize) -> Self {
         self.set_tab_stop(tab_stop);
         self
     }
 
+    /// Check if cursor position is at leftmost before displaying prompt.
+    ///
+    /// By default, we don't check.
+    #[must_use]
+    pub fn check_cursor_position(mut self, yes: bool) -> Self {
+        self.set_check_cursor_position(yes);
+        self
+    }
+
+    /// Indentation size
+    ///
+    /// By default, `2`
+    #[must_use]
+    pub fn indent_size(mut self, indent_size: usize) -> Self {
+        self.set_indent_size(indent_size);
+        self
+    }
+
+    /// Enable or disable bracketed paste on unix platform
+    ///
+    /// By default, it's enabled.
+    #[must_use]
+    pub fn bracketed_paste(mut self, enabled: bool) -> Self {
+        self.enable_bracketed_paste(enabled);
+        self
+    }
+
     /// Builds a `Config` with the settings specified so far.
+    #[must_use]
     pub fn build(self) -> Config {
         self.p
     }
@@ -375,16 +469,18 @@ pub trait Configurer {
     fn config_mut(&mut self) -> &mut Config;
 
     /// Set the maximum length for the history.
-    fn set_max_history_size(&mut self, max_size: usize) {
+    fn set_max_history_size(&mut self, max_size: usize) -> Result<()> {
         self.config_mut().set_max_history_size(max_size);
+        Ok(())
     }
 
     /// Tell if lines which match the previous history entry are saved or not
     /// in the history list.
     ///
     /// By default, they are ignored.
-    fn set_history_ignore_dups(&mut self, yes: bool) {
+    fn set_history_ignore_dups(&mut self, yes: bool) -> Result<()> {
         self.config_mut().set_history_ignore_dups(yes);
+        Ok(())
     }
 
     /// Tell if lines which begin with a space character are saved or not in
@@ -438,11 +534,11 @@ pub trait Configurer {
         self.config_mut().set_color_mode(color_mode);
     }
 
-    /// Whether to use stdout or stderr
+    /// Whether to use stdio or not
     ///
-    /// By default, use stdout
-    fn set_output_stream(&mut self, stream: OutputStreamType) {
-        self.config_mut().set_output_stream(stream);
+    /// By default, stdio is used.
+    fn set_behavior(&mut self, behavior: Behavior) {
+        self.config_mut().set_behavior(behavior);
     }
 
     /// Horizontal space taken by a tab.
@@ -450,5 +546,25 @@ pub trait Configurer {
     /// By default, `8`
     fn set_tab_stop(&mut self, tab_stop: usize) {
         self.config_mut().set_tab_stop(tab_stop);
+    }
+
+    /// Check if cursor position is at leftmost before displaying prompt.
+    ///
+    /// By default, we don't check.
+    fn set_check_cursor_position(&mut self, yes: bool) {
+        self.config_mut().check_cursor_position = yes;
+    }
+    /// Indentation size for indent/dedent commands
+    ///
+    /// By default, `2`
+    fn set_indent_size(&mut self, size: usize) {
+        self.config_mut().set_indent_size(size);
+    }
+
+    /// Enable or disable bracketed paste on unix platform
+    ///
+    /// By default, it's enabled.
+    fn enable_bracketed_paste(&mut self, enabled: bool) {
+        self.config_mut().enable_bracketed_paste = enabled;
     }
 }
