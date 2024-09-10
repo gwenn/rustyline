@@ -67,6 +67,7 @@ fn get_win_size(fd: RawFd) -> (usize, usize) {
                 } else {
                     size.ws_row as usize
                 };
+                debug!(target: "rustyline", "winsize: cols: {}, rows: {}", cols, rows);
                 (cols, rows)
             }
             _ => (80, 24),

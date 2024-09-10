@@ -60,6 +60,7 @@ pub trait Renderer {
     /// Compute layout for rendering prompt + line + some info (either hint,
     /// validation msg, ...). on the screen. Depending on screen width, line
     /// wrapping may be applied.
+    // FIXME
     fn compute_layout(
         &self,
         prompt_size: Position,
@@ -67,6 +68,7 @@ pub trait Renderer {
         line: &LineBuffer,
         info: Option<&str>,
     ) -> Layout {
+        let mut cells = Vec::with_capacity(line.len());
         // calculate the desired position of the cursor
         let pos = line.pos();
         let cursor = self.calculate_position(&line[..pos], prompt_size);
@@ -85,6 +87,7 @@ pub trait Renderer {
             default_prompt,
             cursor,
             end,
+            cells,
         };
         debug_assert!(new_layout.prompt_size <= new_layout.cursor);
         debug_assert!(new_layout.cursor <= new_layout.end);
@@ -93,6 +96,7 @@ pub trait Renderer {
 
     /// Calculate the number of columns and rows used to display `s` on a
     /// `cols` width terminal starting at `orig`.
+    // FIXME
     fn calculate_position(&self, s: &str, orig: Position) -> Position;
 
     fn write_and_flush(&mut self, buf: &str) -> Result<()>;

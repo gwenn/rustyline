@@ -582,6 +582,7 @@ impl LineBuffer {
     }
 
     /// Moves the cursor to the same column in the line above
+    // FIXME
     pub fn move_to_line_up(&mut self, n: RepeatCount) -> bool {
         match self.buf[..self.pos].rfind('\n') {
             Some(off) => {
@@ -610,6 +611,7 @@ impl LineBuffer {
     /// N lines up starting from the current one
     ///
     /// Fails if the cursor is on the first line
+    // FIXME
     fn n_lines_up(&self, n: RepeatCount) -> Option<(usize, usize)> {
         let mut start = if let Some(off) = self.buf[..self.pos].rfind('\n') {
             off + 1
@@ -633,6 +635,7 @@ impl LineBuffer {
     /// N lines down starting from the current one
     ///
     /// Fails if the cursor is on the last line
+    // FIXME
     fn n_lines_down(&self, n: RepeatCount) -> Option<(usize, usize)> {
         let mut end = if let Some(off) = self.buf[self.pos..].find('\n') {
             self.pos + off + 1
@@ -651,7 +654,8 @@ impl LineBuffer {
         Some((start, end))
     }
 
-    /// Moves the cursor to the same column in the line above
+    /// Moves the cursor to the same column in the line below
+    // FIXME
     pub fn move_to_line_down(&mut self, n: RepeatCount) -> bool {
         match self.buf[self.pos..].find('\n') {
             Some(off) => {
