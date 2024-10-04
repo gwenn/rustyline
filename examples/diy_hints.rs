@@ -52,7 +52,7 @@ impl CommandHint {
 impl Hinter for DIYHinter {
     type Hint = CommandHint;
 
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<CommandHint> {
+    fn hint(&mut self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<CommandHint> {
         if line.is_empty() || pos < line.len() {
             return None;
         }

@@ -107,7 +107,7 @@ impl Renderer for Sink {
         _hint: Option<&str>,
         _old_layout: &Layout,
         _new_layout: &Layout,
-        _highlighter: Option<&H>,
+        _highlighter: &mut Option<H>,
     ) -> Result<()> {
         Ok(())
     }

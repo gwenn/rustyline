@@ -127,7 +127,7 @@ pub trait Highlighter {
         docsrs,
         doc(cfg(any(not(feature = "split-highlight"), feature = "ansi-str")))
     )]
-    fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
+    fn highlight<'l>(&mut self, line: &'l str, pos: usize) -> Cow<'l, str> {
         let _ = pos;
         Borrowed(line)
     }
@@ -140,7 +140,7 @@ pub trait Highlighter {
         doc(cfg(all(feature = "split-highlight", not(feature = "ansi-str"))))
     )]
     fn highlight_line<'l>(
-        &self,
+        &mut self,
         line: &'l str,
         pos: usize,
     ) -> impl Iterator<Item = impl 'l + StyledBlock> {
@@ -151,7 +151,7 @@ pub trait Highlighter {
     /// Takes the `prompt` and
     /// returns the highlighted version (with ANSI color).
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
-        &'s self,
+        &'s mut self,
         prompt: &'p str,
         default: bool,
     ) -> Cow<'b, str> {
@@ -160,7 +160,7 @@ pub trait Highlighter {
     }
     /// Takes the `hint` and
     /// returns the highlighted version (with ANSI color).
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+    fn highlight_hint<'h>(&mut self, hint: &'h str) -> Cow<'h, str> {
         Borrowed(hint)
     }
     /// Takes the completion `candidate` and
@@ -168,7 +168,7 @@ pub trait Highlighter {
     ///
     /// Currently, used only with `CompletionType::List`.
     fn highlight_candidate<'c>(
-        &self,
+        &mut self,
         candidate: &'c str, // FIXME should be Completer::Candidate
         completion: CompletionType,
     ) -> Cow<'c, str> {
@@ -182,7 +182,7 @@ pub trait Highlighter {
     ///
     /// Used to optimize refresh when a character is inserted or the cursor is
     /// moved.
-    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
+    fn highlight_char(&mut self, line: &str, pos: usize, forced: bool) -> bool {
         let _ = (line, pos, forced);
         false
     }
@@ -190,15 +190,15 @@ pub trait Highlighter {
 
 impl Highlighter for () {}
 
-impl<'r, H: Highlighter> Highlighter for &'r H {
+impl<'r, H: Highlighter> Highlighter for &'r mut H {
     #[cfg(any(not(feature = "split-highlight"), feature = "ansi-str"))]
-    fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
+    fn highlight<'l>(&mut self, line: &'l str, pos: usize) -> Cow<'l, str> {
         (**self).highlight(line, pos)
     }
 
     #[cfg(all(feature = "split-highlight", not(feature = "ansi-str")))]
     fn highlight_line<'l>(
-        &self,
+        &mut self,
         line: &'l str,
         pos: usize,
     ) -> impl Iterator<Item = impl 'l + StyledBlock> {
@@ -206,26 +206,26 @@ impl<'r, H: Highlighter> Highlighter for &'r H {
     }
 
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
-        &'s self,
+        &'s mut self,
         prompt: &'p str,
         default: bool,
     ) -> Cow<'b, str> {
         (**self).highlight_prompt(prompt, default)
     }
 
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+    fn highlight_hint<'h>(&mut self, hint: &'h str) -> Cow<'h, str> {
         (**self).highlight_hint(hint)
     }
 
     fn highlight_candidate<'c>(
-        &self,
+        &mut self,
         candidate: &'c str,
         completion: CompletionType,
     ) -> Cow<'c, str> {
         (**self).highlight_candidate(candidate, completion)
     }
 
-    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
+    fn highlight_char(&mut self, line: &str, pos: usize, forced: bool) -> bool {
         (**self).highlight_char(line, pos, forced)
     }
 }
@@ -261,7 +261,7 @@ impl MatchingBracketHighlighter {
 ))]
 impl Highlighter for MatchingBracketHighlighter {
     #[cfg(any(not(feature = "split-highlight"), feature = "ansi-str"))]
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+    fn highlight<'l>(&mut self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         if line.len() <= 1 {
             return Borrowed(line);
         }
@@ -278,7 +278,7 @@ impl Highlighter for MatchingBracketHighlighter {
 
     #[cfg(all(feature = "split-highlight", not(feature = "ansi-str")))]
     fn highlight_line<'l>(
-        &self,
+        &mut self,
         line: &'l str,
         _pos: usize,
     ) -> impl Iterator<Item = impl 'l + StyledBlock> {
@@ -298,7 +298,7 @@ impl Highlighter for MatchingBracketHighlighter {
         vec![(AnsiStyle::default(), line)].into_iter()
     }
 
-    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
+    fn highlight_char(&mut self, line: &str, pos: usize, forced: bool) -> bool {
         if forced {
             self.bracket.set(None);
             return false;
