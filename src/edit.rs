@@ -586,7 +586,7 @@ impl<'out, 'prompt, H: Helper> State<'out, 'prompt, H> {
         }
     }
 
-    /// Moves the cursor to the same column in the line above
+    /// Moves the cursor to the same column in the line below
     pub fn edit_move_line_down(&mut self, n: RepeatCount) -> Result<bool> {
         if self.line.move_to_line_down(n) {
             self.move_cursor(CmdKind::MoveCursor)?;
