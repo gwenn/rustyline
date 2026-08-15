@@ -1,23 +1,25 @@
 //! Command processor
 
-use log::debug;
 use std::fmt;
+
+use log::debug;
 use unicode_segmentation::UnicodeSegmentation as _;
 
+use self::RefreshKind::All;
 use super::{Context, Helper, Prompt, Result};
+use crate::KillRing;
 use crate::error::{ReadlineError, Signal};
 use crate::highlight::{CmdKind, Highlighter};
 use crate::hint::Hint;
 use crate::history::SearchDirection;
-use crate::keymap::{Anchor, At, CharSearch, Cmd, Movement, RepeatCount, Word};
-use crate::keymap::{InputState, Invoke, Refresher};
-use crate::layout::{cwidh, Layout, Position, Unit};
-use crate::line_buffer::{DeleteListener, Direction, LineBuffer, NoListener, WordAction, MAX_LINE};
+use crate::keymap::{
+    Anchor, At, CharSearch, Cmd, InputState, Invoke, Movement, Refresher, RepeatCount, Word,
+};
+use crate::layout::{Layout, Position, Unit, cwidh};
+use crate::line_buffer::{DeleteListener, Direction, LineBuffer, MAX_LINE, NoListener, WordAction};
 use crate::tty::{Renderer as _, Term, Terminal};
 use crate::undo::Changeset;
 use crate::validate::{ValidationContext, ValidationResult};
-use crate::KillRing;
-use RefreshKind::All;
 
 /// Represent the state during line editing.
 /// Implement rendering.
@@ -414,11 +416,7 @@ impl<H: Helper, P: Prompt + ?Sized> State<'_, '_, H, P> {
             false
         };
         self.changes.end();
-        if succeed {
-            self.refresh_line()
-        } else {
-            Ok(())
-        }
+        if succeed { self.refresh_line() } else { Ok(()) }
     }
 
     /// Overwrite the character under the cursor (Vi mode)
@@ -537,16 +535,6 @@ impl<H: Helper, P: Prompt + ?Sized> State<'_, '_, H, P> {
             end_shift: Unit,    // end of line shift (columns) after kill
             trivial: bool,      // true if a partial screen update can be done
         }
-        let mut proxy = Proxy {
-            changes: &mut self.changes,
-            kill_ring,
-            layout: &self.layout,
-            pos: self.line.pos(),
-            end: self.line.len(),
-            cursor_shift: 0,
-            end_shift: 0,
-            trivial: self.layout.cursor.row == self.layout.end.row,
-        };
         impl DeleteListener for Proxy<'_> {
             fn start_killing(&mut self) {
                 self.kill_ring.start_killing();
@@ -578,6 +566,16 @@ impl<H: Helper, P: Prompt + ?Sized> State<'_, '_, H, P> {
                 self.kill_ring.stop_killing();
             }
         }
+        let mut proxy = Proxy {
+            changes: &mut self.changes,
+            kill_ring,
+            layout: &self.layout,
+            pos: self.line.pos(),
+            end: self.line.len(),
+            cursor_shift: 0,
+            end_shift: 0,
+            trivial: self.layout.cursor.row == self.layout.end.row,
+        };
         if self.line.kill(mvt, &mut proxy) {
             let (trivial, cursor_shift, end_shift) =
                 (proxy.trivial, proxy.cursor_shift, proxy.end_shift);
@@ -624,11 +622,7 @@ impl<H: Helper, P: Prompt + ?Sized> State<'_, '_, H, P> {
         self.changes.begin();
         let succeed = self.line.transpose_chars(&mut self.changes);
         self.changes.end();
-        if succeed {
-            self.refresh_line()
-        } else {
-            Ok(())
-        }
+        if succeed { self.refresh_line() } else { Ok(()) }
     }
 
     pub fn edit_move_to_prev_word(&mut self, word_def: Word, n: RepeatCount) -> Result<()> {
@@ -679,22 +673,14 @@ impl<H: Helper, P: Prompt + ?Sized> State<'_, '_, H, P> {
         self.changes.begin();
         let succeed = self.line.edit_word(a, &mut self.changes);
         self.changes.end();
-        if succeed {
-            self.refresh_line()
-        } else {
-            Ok(())
-        }
+        if succeed { self.refresh_line() } else { Ok(()) }
     }
 
     pub fn edit_transpose_words(&mut self, n: RepeatCount) -> Result<()> {
         self.changes.begin();
         let succeed = self.line.transpose_words(n, &mut self.changes);
         self.changes.end();
-        if succeed {
-            self.refresh_line()
-        } else {
-            Ok(())
-        }
+        if succeed { self.refresh_line() } else { Ok(()) }
     }
 
     /// Substitute the currently edited line with the next or previous history

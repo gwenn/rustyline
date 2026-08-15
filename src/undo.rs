@@ -1,10 +1,11 @@
 //! Undo API
 use std::fmt::Debug;
 
-use crate::keymap::RepeatCount;
-use crate::line_buffer::{ChangeListener, DeleteListener, Direction, LineBuffer, NoListener};
 use log::debug;
 use unicode_segmentation::UnicodeSegmentation as _;
+
+use crate::keymap::RepeatCount;
+use crate::line_buffer::{ChangeListener, DeleteListener, Direction, LineBuffer, NoListener};
 
 enum Change {
     Begin,
@@ -319,8 +320,8 @@ impl Changeset {
     pub(crate) fn last_insert(&self) -> Option<String> {
         for change in self.undos.iter().rev() {
             match change {
-                Change::Insert { ref text, .. } => return Some(text.clone()),
-                Change::Replace { ref new, .. } => return Some(new.clone()),
+                Change::Insert { text, .. } => return Some(text.clone()),
+                Change::Replace { new, .. } => return Some(new.clone()),
                 Change::End => {
                     continue;
                 }

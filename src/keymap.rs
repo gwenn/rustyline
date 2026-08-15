@@ -592,6 +592,7 @@ impl<'b> InputState<'b> {
                     let snd_key = match evt {
                         // we may have already read the second key in custom_seq_binding
                         #[allow(clippy::out_of_bounds_indexing)]
+                        #[allow(unconditional_panic)]
                         Event::KeySeq(ref key_seq) if key_seq.len() > 1 => key_seq[1],
                         _ => rdr.next_key(true)?,
                     };
@@ -1127,9 +1128,8 @@ impl<'b> InputState<'b> {
         let num_args = self.num_args();
         if num_args < 0 {
             unreachable!()
-        } else {
-            num_args.unsigned_abs() as RepeatCount
         }
+        num_args.unsigned_abs() as RepeatCount
     }
 }
 
@@ -1159,7 +1159,7 @@ impl InputState<'_> {
                     None
                 }
             }
-            _ => None
+            _ => None,
         }
     }
 
@@ -1176,7 +1176,7 @@ impl InputState<'_> {
             feature = "custom-bindings" => {
                 while let Some(subtrie) = self.custom_bindings.get_raw_descendant(evt) {
                     let snd_key = rdr.next_key(true)?;
-                    if let Event::KeySeq(ref mut key_seq) = evt {
+                    if let Event::KeySeq(key_seq) = evt {
                         key_seq.push(snd_key);
                     } else {
                         break;
@@ -1204,22 +1204,22 @@ impl InputState<'_> {
 
 cfg_select! {
     feature = "custom-bindings" => {
-pub type Bindings = radix_trie::Trie<Event, EventHandler>;
+        pub type Bindings = radix_trie::Trie<Event, EventHandler>;
     }
     _ => {
-enum Event {
-   KeySeq([KeyEvent; 1]),
-}
-impl From<KeyEvent> for Event {
-    fn from(k: KeyEvent) -> Self {
-        Self::KeySeq([k])
-    }
-}
-pub struct Bindings {}
-impl Bindings {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
+        enum Event {
+            KeySeq([KeyEvent; 1]),
+        }
+        impl From<KeyEvent> for Event {
+            fn from(k: KeyEvent) -> Self {
+                Self::KeySeq([k])
+            }
+        }
+        pub struct Bindings {}
+        impl Bindings {
+            pub fn new() -> Self {
+                Self {}
+            }
+        }
     }
 }

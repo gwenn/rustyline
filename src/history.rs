@@ -1,10 +1,7 @@
 //! History API
 
-#[cfg(feature = "with-file-history")]
-use log::{debug, warn};
 use std::borrow::Cow;
-use std::collections::vec_deque;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, vec_deque};
 #[cfg(feature = "with-file-history")]
 use std::fs::{File, OpenOptions};
 #[cfg(feature = "with-file-history")]
@@ -13,6 +10,9 @@ use std::ops::Index;
 use std::path::Path;
 #[cfg(feature = "with-file-history")]
 use std::time::SystemTime;
+
+#[cfg(feature = "with-file-history")]
+use log::{debug, warn};
 
 use super::Result;
 use crate::config::{Config, HistoryDuplicates};
@@ -55,6 +55,9 @@ pub trait History {
     ///
     /// `SearchDirection` is useful only for implementations without direct
     /// indexing.
+    ///
+    /// # Errors
+    /// Will return `Err` if history entry cannot be retrieved
     fn get(&self, index: usize, dir: SearchDirection) -> Result<Option<SearchResult<'_>>>;
 
     // termwiz: fn last(&self) -> Option<HistoryIndex>;
@@ -70,11 +73,17 @@ pub trait History {
     ///
     /// Return false if the `line` has been ignored (blank line / duplicate /
     /// ...).
+    ///
+    /// # Errors
+    /// Will return `Err` if entry cannot be persisted
     fn add(&mut self, line: &str) -> Result<bool>;
     /// Add a new entry in the history.
     ///
     /// Return false if the `line` has been ignored (blank line / duplicate /
     /// ...).
+    ///
+    /// # Errors
+    /// Will return `Err` if entry cannot be persisted
     fn add_owned(&mut self, line: String) -> Result<bool>; // TODO check AsRef<str> + Into<String> vs object safe
 
     /// Return the number of entries in the history.
@@ -110,20 +119,32 @@ pub trait History {
     /// smaller than the amount of items already inside the history.
     ///
     /// Like [stifle_history](http://tiswww.case.edu/php/chet/readline/history.html#IDX11).
+    ///
+    /// # Errors
+    /// Will return `Err` if the size cannot be changed
     fn set_max_len(&mut self, len: usize) -> Result<()>;
 
     /// Ignore consecutive duplicates
+    ///
+    /// # Errors
+    /// Will return `Err` if this setting cannot be changed
     fn ignore_dups(&mut self, yes: bool) -> Result<()>;
 
     /// Ignore lines which begin with a space or not
     fn ignore_space(&mut self, yes: bool);
 
     /// Save the history in the specified file.
+    ///
+    /// # Errors
+    /// Will return `Err` if an IO error occurs
     // TODO history_truncate_file
     // https://tiswww.case.edu/php/chet/readline/history.html#IDX31
     fn save(&mut self, path: &Path) -> Result<()>; // FIXME Path vs AsRef<Path>
 
     /// Append new entries in the specified file.
+    ///
+    /// # Errors
+    /// Will return `Err` if an IO error occurs
     // Like [append_history](http://tiswww.case.edu/php/chet/readline/history.html#IDX30).
     fn append(&mut self, path: &Path) -> Result<()>; // FIXME Path vs AsRef<Path>
 
@@ -134,6 +155,9 @@ pub trait History {
     fn load(&mut self, path: &Path) -> Result<()>; // FIXME Path vs AsRef<Path>
 
     /// Clear in-memory history
+    ///
+    /// # Errors
+    /// Will return `Err` if an IO error occurs
     fn clear(&mut self) -> Result<()>;
 
     // termwiz: fn search(
@@ -154,6 +178,9 @@ pub trait History {
     /// Return None if no entry contains `term` between [start, len -1] for
     /// forward search
     /// or between [0, start] for reverse search.
+    ///
+    /// # Errors
+    /// Will return `Err` if an IO error occurs
     fn search(
         &self,
         term: &str,
@@ -162,6 +189,9 @@ pub trait History {
     ) -> Result<Option<SearchResult<'_>>>;
 
     /// Anchored search
+    ///
+    /// # Errors
+    /// Will return `Err` if an IO error occurs
     fn starts_with(
         &self,
         term: &str,
@@ -261,12 +291,11 @@ impl MemHistory {
         {
             return true;
         }
-        if self.ignore_dups {
-            if let Some(s) = self.entries.back() {
-                if s == line {
-                    return true;
-                }
-            }
+        if self.ignore_dups
+            && let Some(s) = self.entries.back()
+            && s == line
+        {
+            return true;
         }
         false
     }
@@ -365,7 +394,7 @@ impl History for MemHistory {
     ) -> Result<Option<SearchResult<'_>>> {
         cfg_select! {
             feature = "case_insensitive_history_search" => {
-                use regex::{escape, RegexBuilder};
+                use regex::{RegexBuilder, escape};
                 Ok(
                     if let Ok(re) = RegexBuilder::new(&escape(term))
                         .case_insensitive(true)
@@ -393,16 +422,14 @@ impl History for MemHistory {
     ) -> Result<Option<SearchResult<'_>>> {
         cfg_select! {
             feature = "case_insensitive_history_search" => {
-                use regex::{escape, RegexBuilder};
+                use regex::{RegexBuilder, escape};
                 Ok(
                     if let Ok(re) = RegexBuilder::new(&escape(term))
                         .case_insensitive(true)
                         .build()
                     {
                         let test = |entry: &str| {
-                            re.find(entry)
-                                .filter(|m| m.start() == 0)
-                                .map(|m| m.end())
+                            re.find(entry).filter(|m| m.start() == 0).map(|m| m.end())
                         };
                         self.search_match(term, start, dir, test)
                     } else {
@@ -627,7 +654,6 @@ impl FileHistory {
     }
 
     /// Return a forward iterator.
-    #[must_use]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &String> + '_ {
         self.mem.entries.iter()
     }
@@ -838,8 +864,8 @@ cfg_select! {
 #[cfg(test)]
 mod tests {
     use super::{DefaultHistory, History as _, SearchDirection, SearchResult};
-    use crate::config::Config;
     use crate::Result;
+    use crate::config::Config;
 
     fn init() -> DefaultHistory {
         let mut history = DefaultHistory::new();

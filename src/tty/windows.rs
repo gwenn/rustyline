@@ -2,30 +2,27 @@
 #![expect(clippy::try_err)] // suggested fix does not work (cannot infer...)
 
 use std::fs::OpenOptions;
-use std::io;
-use std::mem;
 use std::os::windows::io::IntoRawHandle as _;
-use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::{io, mem, ptr};
 
 use log::{debug, warn};
 use unicode_segmentation::UnicodeSegmentation as _;
-use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{self as foundation, FALSE, HANDLE, TRUE};
-use windows_sys::Win32::System::Console as console;
-use windows_sys::Win32::System::Threading as threading;
+use windows_sys::Win32::System::{Console as console, Threading as threading};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse;
+use windows_sys::core::BOOL;
 
-use super::{width, Event, RawMode, RawReader, Renderer, Term};
+use super::{Event, RawMode, RawReader, Renderer, Term, width};
 use crate::config::{Behavior, BellStyle, ColorMode, Config};
 use crate::highlight::Highlighter;
 use crate::keys::{KeyCode as K, KeyEvent, Modifiers as M};
 use crate::layout::{GraphemeClusterMode, Layout, Position, Unit};
 use crate::line_buffer::LineBuffer;
-use crate::{error, Cmd, Prompt, Result};
+use crate::{Cmd, Prompt, Result, error};
 
 fn get_std_handle(fd: console::STD_HANDLE) -> Result<HANDLE> {
     let handle = unsafe { console::GetStdHandle(fd) };
@@ -115,7 +112,7 @@ impl ConsoleRawReader {
 
     fn select(&mut self) -> Result<Event> {
         use foundation::WAIT_OBJECT_0;
-        use threading::{WaitForMultipleObjects, INFINITE};
+        use threading::{INFINITE, WaitForMultipleObjects};
 
         let pipe_reader = self.pipe_reader.as_ref().unwrap();
         let handles = [self.conin, pipe_reader.event.0];
@@ -171,10 +168,11 @@ impl RawReader for ConsoleRawReader {
 }
 
 fn read_input(handle: HANDLE, max_count: u32) -> Result<KeyEvent> {
+    use std::char::decode_utf16;
+
     use console::{
         LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
     };
-    use std::char::decode_utf16;
 
     let mut rec: console::INPUT_RECORD = unsafe { mem::zeroed() };
     let mut count = 0;
@@ -596,12 +594,12 @@ impl Renderer for ConsoleRenderer {
         cursor.X = 0;
         cursor.Y += 1;
         let res = self.set_console_cursor_position(cursor, info.dwSize);
-        if let Err(error::ReadlineError::Io(ref e)) = res {
-            if e.raw_os_error() == Some(foundation::ERROR_INVALID_PARAMETER as i32) {
-                warn!(target: "rustyline", "invalid cursor position: ({:?}, {:?}) in ({:?}, {:?})", cursor.X, cursor.Y, info.dwSize.X, info.dwSize.Y);
-                write_all(self.conout, &[10; 1])?;
-                return Ok(());
-            }
+        if let Err(error::ReadlineError::Io(ref e)) = res
+            && e.raw_os_error() == Some(foundation::ERROR_INVALID_PARAMETER as i32)
+        {
+            warn!(target: "rustyline", "invalid cursor position: ({:?}, {:?}) in ({:?}, {:?})", cursor.X, cursor.Y, info.dwSize.X, info.dwSize.Y);
+            write_all(self.conout, &[10; 1])?;
+            return Ok(());
         }
         res.map(|_| ())
     }

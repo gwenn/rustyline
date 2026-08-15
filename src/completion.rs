@@ -58,6 +58,9 @@ pub trait Completer {
     /// partial word to be completed.
     ///
     /// `("ls /usr/loc", 11)` => `Ok((3, vec!["/usr/local/"]))`
+    ///
+    /// # Errors
+    /// Will return `Err` if candidates cannot be retrieved
     fn complete(
         &self, // FIXME should be `&mut self`
         line: &str,
@@ -65,7 +68,7 @@ pub trait Completer {
         ctx: &Context<'_>,
     ) -> Result<(usize, Vec<Self::Candidate>)> {
         let _ = (line, pos, ctx);
-        Ok((0, Vec::with_capacity(0)))
+        Ok((0, Vec::new()))
     }
     /// Updates the edited `line` with the `elected` candidate.
     fn update(&self, line: &mut LineBuffer, start: usize, elected: &str, cl: &mut Changeset) {
@@ -99,9 +102,10 @@ macro_rules! box_completer {
     }
 }
 
-use crate::undo::Changeset;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use crate::undo::Changeset;
 box_completer! { Box Rc Arc }
 
 /// A `Completer` for file and folder names.
@@ -115,29 +119,72 @@ const DOUBLE_QUOTES_ESCAPE_CHAR: Option<char> = Some('\\');
 cfg_select! {
     unix => {
         // rl_basic_word_break_characters, rl_completer_word_break_characters
-        const fn default_break_chars(c : char) -> bool {
-            matches!(c, ' ' | '\t' | '\n' | '"' | '\\' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' |
-            '{' | '(' | '\0')
+        const fn default_break_chars(c: char) -> bool {
+            matches!(
+                c,
+                ' ' | '\t'
+                    | '\n'
+                    | '"'
+                    | '\\'
+                    | '\''
+                    | '`'
+                    | '@'
+                    | '$'
+                    | '>'
+                    | '<'
+                    | '='
+                    | ';'
+                    | '|'
+                    | '&'
+                    | '{'
+                    | '('
+                    | '\0'
+            )
         }
         const ESCAPE_CHAR: Option<char> = Some('\\');
         // In double quotes, not all break_chars need to be escaped
         // https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
-        const fn double_quotes_special_chars(c: char) -> bool { matches!(c, '"' | '$' | '\\' | '`') }
+        const fn double_quotes_special_chars(c: char) -> bool {
+            matches!(c, '"' | '$' | '\\' | '`')
+        }
     }
     windows => {
         // Remove \ to make file completion works on windows
         const fn default_break_chars(c: char) -> bool {
-            matches!(c, ' ' | '\t' | '\n' | '"' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' | '{' |
-            '(' | '\0')
+            matches!(
+                c,
+                ' ' | '\t'
+                    | '\n'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '@'
+                    | '$'
+                    | '>'
+                    | '<'
+                    | '='
+                    | ';'
+                    | '|'
+                    | '&'
+                    | '{'
+                    | '('
+                    | '\0'
+            )
         }
         const ESCAPE_CHAR: Option<char> = None;
-         // TODO Validate: only '"' ?
-        const fn double_quotes_special_chars(c: char) -> bool { c == '"' }
+        // TODO Validate: only '"' ?
+        const fn double_quotes_special_chars(c: char) -> bool {
+            c == '"'
+        }
     }
     target_arch = "wasm32" => {
-        const fn default_break_chars(c: char) -> bool { false }
+        const fn default_break_chars(c: char) -> bool {
+            false
+        }
         const ESCAPE_CHAR: Option<char> = None;
-        const fn double_quotes_special_chars(c: char) -> bool { false }
+        const fn double_quotes_special_chars(c: char) -> bool {
+            false
+        }
     }
 }
 
@@ -165,6 +212,9 @@ impl FilenameCompleter {
     /// Takes the currently edited `line` with the cursor `pos`ition and
     /// returns the start position and the completion candidates for the
     /// partial path to be completed.
+    ///
+    /// # Errors
+    /// Will return `Err` if candidates cannot be retrieved
     pub fn complete_path(&self, line: &str, pos: usize) -> Result<(usize, Vec<Pair>)> {
         let (start, mut matches) = self.complete_path_unsorted(line, pos)?;
         matches.sort_by(|a, b| a.display().cmp(b.display()));
@@ -172,6 +222,9 @@ impl FilenameCompleter {
     }
 
     /// Similar to [`Self::complete_path`], but the returned paths are unsorted.
+    ///
+    /// # Errors
+    /// Will return `Err` if candidates cannot be retrieved
     pub fn complete_path_unsorted(&self, line: &str, pos: usize) -> Result<(usize, Vec<Pair>)> {
         let (start, path, esc_char, break_chars, quote) =
             if let Some((idx, quote)) = find_unclosed_quote(&line[..pos]) {
@@ -287,9 +340,10 @@ fn filename_complete(
     is_break_char: fn(char) -> bool,
     quote: Quote,
 ) -> Vec<Pair> {
+    use std::env::current_dir;
+
     #[cfg(feature = "with-dirs")]
     use home::home_dir;
-    use std::env::current_dir;
 
     let sep = path::MAIN_SEPARATOR;
     let (dir_name, file_name) = match path.rfind(sep) {
@@ -301,7 +355,7 @@ fn filename_complete(
     let dir = if dir_path.starts_with("~") {
         // ~[/...]
         cfg_select! {
-            feature = "with-dirs" =>
+            feature = "with-dirs" => {
                 if let Some(home) = home_dir() {
                     match dir_path.strip_prefix("~") {
                         Ok(rel_path) => home.join(rel_path),
@@ -310,7 +364,8 @@ fn filename_complete(
                 } else {
                     dir_path.to_path_buf()
                 }
-            _ => dir_path.to_path_buf()
+            }
+            _ => dir_path.to_path_buf(),
         }
     } else if dir_path.is_relative() {
         // TODO ~user[/...] (https://crates.io/crates/users)
@@ -336,18 +391,18 @@ fn filename_complete(
         for entry in read_dir.flatten() {
             if let Some(s) = entry.file_name().to_str() {
                 let ns = normalize(s);
-                if ns.starts_with(file_name.as_ref()) {
-                    if let Ok(metadata) = fs::metadata(entry.path()) {
-                        let mut path = String::from(dir_name) + s;
-                        if metadata.is_dir() {
-                            path.push(sep);
-                        }
-                        entries.push(Pair {
-                            display: String::from(s),
-                            replacement: escape(path, esc_char, is_break_char, quote),
-                        });
-                    } // else ignore PermissionDenied
-                }
+                if ns.starts_with(file_name.as_ref())
+                    && let Ok(metadata) = fs::metadata(entry.path())
+                {
+                    let mut path = String::from(dir_name) + s;
+                    if metadata.is_dir() {
+                        path.push(sep);
+                    }
+                    entries.push(Pair {
+                        display: String::from(s),
+                        replacement: escape(path, esc_char, is_break_char, quote),
+                    });
+                } // else ignore PermissionDenied
             }
         }
     }
@@ -358,7 +413,7 @@ fn normalize(s: &str) -> Cow<'_, str> {
     cfg_select! {
         windows => Owned(s.to_lowercase()), // case-insensitive
         target_os = "macos" => Owned(s.to_lowercase()), // case-insensitive
-        _ => Cow::Borrowed(s)
+        _ => Cow::Borrowed(s),
     }
 }
 

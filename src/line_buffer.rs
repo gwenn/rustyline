@@ -1,12 +1,13 @@
 //! Line buffer with current cursor position
-use crate::keymap::{At, CharSearch, Movement, RepeatCount, Word};
-use crate::layout::Layout;
 use std::cmp::min;
-use std::fmt;
-use std::iter;
 use std::ops::{Deref, Index as _, Range};
 use std::string::Drain;
+use std::{fmt, iter};
+
 use unicode_segmentation::UnicodeSegmentation as _;
+
+use crate::keymap::{At, CharSearch, Movement, RepeatCount, Word};
+use crate::layout::Layout;
 
 /// Default maximum buffer size for the line read
 pub(crate) const MAX_LINE: usize = 4096;
@@ -142,6 +143,9 @@ impl LineBuffer {
     }
 
     /// Set cursor position (byte position)
+    ///
+    /// # Panics
+    /// when `pos` > lenngth
     pub fn set_pos(&mut self, pos: usize) {
         assert!(pos <= self.buf.len());
         self.pos = pos;
@@ -160,6 +164,9 @@ impl LineBuffer {
     }
 
     /// Set line content (`buf`) and cursor position (`pos`).
+    ///
+    /// # Panics
+    /// when `pos` > lenngth
     pub fn update<C: ChangeListener>(&mut self, buf: &str, pos: usize, cl: &mut C) {
         assert!(pos <= buf.len());
         let end = self.len();
@@ -822,27 +829,27 @@ impl LineBuffer {
 
     /// Alter the next word.
     pub fn edit_word<C: ChangeListener>(&mut self, a: WordAction, cl: &mut C) -> bool {
-        if let Some(start) = self.skip_whitespace() {
-            if let Some(end) = self.next_word_pos(start, At::AfterEnd, Word::Emacs, 1) {
-                if start == end {
-                    return false;
-                }
-                let word = self
-                    .drain(start..end, Direction::default(), cl)
-                    .collect::<String>();
-                let result = match a {
-                    WordAction::Capitalize => {
-                        let ch = word.graphemes(true).next().unwrap();
-                        let cap = ch.to_uppercase();
-                        cap + &word[ch.len()..].to_lowercase()
-                    }
-                    WordAction::Lowercase => word.to_lowercase(),
-                    WordAction::Uppercase => word.to_uppercase(),
-                };
-                self.insert_str(start, &result, cl);
-                self.pos = start + result.len();
-                return true;
+        if let Some(start) = self.skip_whitespace()
+            && let Some(end) = self.next_word_pos(start, At::AfterEnd, Word::Emacs, 1)
+        {
+            if start == end {
+                return false;
             }
+            let word = self
+                .drain(start..end, Direction::default(), cl)
+                .collect::<String>();
+            let result = match a {
+                WordAction::Capitalize => {
+                    let ch = word.graphemes(true).next().unwrap();
+                    let cap = ch.to_uppercase();
+                    cap + &word[ch.len()..].to_lowercase()
+                }
+                WordAction::Lowercase => word.to_lowercase(),
+                WordAction::Uppercase => word.to_uppercase(),
+            };
+            self.insert_str(start, &result, cl);
+            self.pos = start + result.len();
+            return true;
         }
         false
     }
@@ -1199,12 +1206,10 @@ fn is_other_char(grapheme: &str) -> bool {
 #[cfg(test)]
 mod test {
     use super::{
-        ChangeListener, DeleteListener, Direction, LineBuffer, NoListener, WordAction, MAX_LINE,
+        ChangeListener, DeleteListener, Direction, LineBuffer, MAX_LINE, NoListener, WordAction,
     };
-    use crate::{
-        keymap::{At, CharSearch, Movement, Word},
-        layout::Layout,
-    };
+    use crate::keymap::{At, CharSearch, Movement, Word};
+    use crate::layout::Layout;
 
     struct Listener {
         deleted_str: Option<String>,

@@ -20,11 +20,10 @@ impl GraphemeClusterMode {
 
     /// Use environment variables to guess current mode
     #[cfg(not(test))]
+    #[must_use]
     pub fn from_env() -> Self {
         let gcm = match std::env::var("TERM_PROGRAM").as_deref() {
-            Ok("Apple_Terminal") => GraphemeClusterMode::Unicode,
-            Ok("iTerm.app") => GraphemeClusterMode::Unicode,
-            Ok("WezTerm") => GraphemeClusterMode::Unicode,
+            Ok("Apple_Terminal" | "iTerm.app" | "WezTerm") => GraphemeClusterMode::Unicode,
             Err(std::env::VarError::NotPresent) => match std::env::var("TERM").as_deref() {
                 Ok("xterm-kitty") => GraphemeClusterMode::NoZwj,
                 _ => GraphemeClusterMode::WcWidth,
@@ -36,6 +35,7 @@ impl GraphemeClusterMode {
     }
 
     /// Grapheme with / number of columns
+    #[must_use]
     pub fn width(&self, s: &str) -> Unit {
         match self {
             GraphemeClusterMode::Unicode => uwidth(s),

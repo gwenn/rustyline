@@ -1,6 +1,8 @@
 //! Customize line editor
-use crate::{layout::GraphemeClusterMode, Result};
 use std::default::Default;
+
+use crate::Result;
+use crate::layout::GraphemeClusterMode;
 
 /// User preferences
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -551,6 +553,9 @@ pub trait Configurer {
     fn config_mut(&mut self) -> &mut Config;
 
     /// Set the maximum length for the history.
+    ///
+    /// # Errors
+    /// Will return `Err` if size cannot be changed
     fn set_max_history_size(&mut self, max_size: usize) -> Result<()> {
         self.config_mut().set_max_history_size(max_size);
         Ok(())
@@ -560,6 +565,9 @@ pub trait Configurer {
     /// in the history list.
     ///
     /// By default, they are ignored.
+    ///
+    /// # Errors
+    /// Will return `Err` if this setting cannot be changed
     fn set_history_ignore_dups(&mut self, yes: bool) -> Result<()> {
         self.config_mut().set_history_ignore_dups(yes);
         Ok(())

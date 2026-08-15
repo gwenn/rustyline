@@ -2,8 +2,7 @@
 #[cfg(windows)]
 use std::char;
 use std::error::Error;
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 /// The error type for Rustyline errors that can arise from
 /// I/O related errors or Errno when using the nix-rust library
@@ -121,12 +120,11 @@ impl Error for SignalError {}
 impl From<io::Error> for ReadlineError {
     fn from(err: io::Error) -> Self {
         #[cfg(unix)]
-        if err.kind() == io::ErrorKind::Interrupted {
-            if let Some(e) = err.get_ref() {
-                if let Some(se) = e.downcast_ref::<SignalError>() {
-                    return Self::Signal(se.0);
-                }
-            }
+        if err.kind() == io::ErrorKind::Interrupted
+            && let Some(e) = err.get_ref()
+            && let Some(se) = e.downcast_ref::<SignalError>()
+        {
+            return Self::Signal(se.0);
         }
         Self::Io(err)
     }

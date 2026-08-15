@@ -15,12 +15,12 @@ impl KeyEvent {
     /// Constructor from `char` and modifiers
     #[must_use]
     pub fn new(c: char, mut mods: Modifiers) -> Self {
-        use {KeyCode as K, KeyEvent as E, Modifiers as M};
+        use self::{KeyCode as K, KeyEvent as E, Modifiers as M};
 
         if !c.is_control() {
             if !mods.is_empty() {
                 mods.remove(M::SHIFT); // TODO Validate: no SHIFT even if
-                                       // `c` is uppercase
+                // `c` is uppercase
             }
             return E(K::Char(c), mods);
         }
@@ -97,7 +97,7 @@ impl KeyEvent {
     /// shift-Tab => `BackTab`
     #[must_use]
     pub fn normalize(e: Self) -> Self {
-        use {KeyCode as K, KeyEvent as E, Modifiers as M};
+        use self::{KeyCode as K, KeyEvent as E, Modifiers as M};
 
         match e {
             E(K::Char(c), m) if c.is_ascii_control() => Self::new(c, m),
