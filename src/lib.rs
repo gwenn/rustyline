@@ -364,7 +364,7 @@ fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
         s.out.write_and_flush(ab.as_str())?;
     }
     s.out.write_and_flush("\n")?;
-    s.repaint(RefreshKind::Min)?;
+    s.repaint(RefreshKind::All)?;
     Ok(None)
 }
 
