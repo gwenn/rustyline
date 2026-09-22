@@ -1,11 +1,11 @@
 #![cfg(all(unix, not(feature = "signal-hook")))]
 
-use rexpect::{
-    error::Error,
-    process::Signal,
-    session::{spawn_command, PtySession},
-};
 use std::process::Command;
+
+use rexpect::error::Error;
+use rexpect::reader::Options;
+use rexpect::process::Signal;
+use rexpect::session::{PtySession, spawn_with_options};
 
 fn wrap(f: fn(&mut PtySession) -> Result<(), Error>, styled: bool, eof: &str) -> Result<(), Error> {
     let bin = env!("CARGO_BIN_EXE_re");
@@ -13,7 +13,8 @@ fn wrap(f: fn(&mut PtySession) -> Result<(), Error>, styled: bool, eof: &str) ->
     if styled {
         cmd.arg("-s");
     }
-    let mut p = spawn_command(cmd, Some(2_000))?;
+    let mut p = spawn_with_options(cmd, Options::new().timeout_ms(Some(2_000))
+        .strip_ansi_escape_codes(false))?; // FIXME strip_ansi_escape_codes doesn't seem to work as expected
     p.exp_string("\x1b[?2004h")?; // bracketed paste on
     prompt(&mut p, styled)?;
     f(&mut p)?;
